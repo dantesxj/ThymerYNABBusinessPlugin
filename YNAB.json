@@ -1,0 +1,214 @@
+{
+  "fields": [
+    {
+      "icon": "ti-calendar",
+      "id": "date",
+      "label": "Date",
+      "many": false,
+      "read_only": false,
+      "active": true,
+      "type": "datetime"
+    },
+    {
+      "icon": "ti-user",
+      "id": "payee",
+      "label": "Payee",
+      "many": false,
+      "read_only": false,
+      "active": true,
+      "type": "text"
+    },
+    {
+      "icon": "ti-coin",
+      "id": "amount",
+      "label": "Amount",
+      "many": false,
+      "read_only": false,
+      "active": true,
+      "type": "number"
+    },
+    {
+      "icon": "ti-tag",
+      "id": "category",
+      "label": "Category",
+      "many": false,
+      "read_only": false,
+      "active": true,
+      "type": "text"
+    },
+    {
+      "icon": "ti-layout-grid",
+      "id": "category_group",
+      "label": "Category Group",
+      "many": false,
+      "read_only": false,
+      "active": true,
+      "type": "text"
+    },
+    {
+      "icon": "ti-notes",
+      "id": "memo",
+      "label": "Memo",
+      "many": false,
+      "read_only": false,
+      "active": true,
+      "type": "text"
+    },
+    {
+      "icon": "ti-receipt",
+      "id": "receipt",
+      "label": "Receipt",
+      "many": false,
+      "read_only": false,
+      "active": true,
+      "type": "file"
+    },
+    {
+      "icon": "ti-building-bank",
+      "id": "account",
+      "label": "Account",
+      "many": false,
+      "read_only": false,
+      "active": true,
+      "type": "text"
+    },
+    {
+      "icon": "ti-circle-check",
+      "id": "cleared",
+      "label": "Cleared",
+      "many": false,
+      "read_only": false,
+      "active": true,
+      "type": "choice",
+      "choices": [
+        {
+          "id": "cleared",
+          "label": "Cleared",
+          "color": "2",
+          "active": true
+        },
+        {
+          "id": "uncleared",
+          "label": "Uncleared",
+          "color": "5",
+          "active": true
+        },
+        {
+          "id": "reconciled",
+          "label": "Reconciled",
+          "color": "3",
+          "active": true
+        }
+      ]
+    },
+    {
+      "icon": "ti-arrow-up-down",
+      "id": "transaction_type",
+      "label": "Type",
+      "many": false,
+      "read_only": false,
+      "active": true,
+      "type": "choice",
+      "choices": [
+        {
+          "id": "income",
+          "label": "Income",
+          "color": "2",
+          "active": true
+        },
+        {
+          "id": "expense",
+          "label": "Expense",
+          "color": "0",
+          "active": true
+        }
+      ]
+    },
+    {
+      "icon": "ti-hash",
+      "id": "ynab_id",
+      "label": "YNAB ID",
+      "many": false,
+      "read_only": false,
+      "active": false,
+      "type": "text"
+    },
+    {
+      "icon": "ti-clock-edit",
+      "id": "synced_at",
+      "label": "Last Synced",
+      "many": false,
+      "read_only": false,
+      "active": false,
+      "type": "datetime"
+    }
+  ],
+  "sidebar_record_sort_dir": "desc",
+  "sidebar_record_sort_field_id": "date",
+  "managed": {
+    "fields": false,
+    "views": false,
+    "sidebar": false
+  },
+  "custom": {},
+  "views": [
+    {
+      "id": "VYNAB000",
+      "shown": true,
+      "icon": "ti-dashboard",
+      "label": "Dashboard",
+      "description": "Income & expense overview with filters and export",
+      "field_ids": [],
+      "type": "custom",
+      "read_only": false,
+      "group_by_field_id": null,
+      "sort_dir": "desc",
+      "sort_field_id": "date",
+      "opts": {}
+    },
+    {
+      "id": "VYNAB001",
+      "shown": true,
+      "icon": "ti-layout-kanban",
+      "label": "Income vs Expenses",
+      "description": "Board grouped by type",
+      "field_ids": [
+        "date",
+        "payee",
+        "amount",
+        "category",
+        "category_group",
+        "memo",
+        "cleared"
+      ],
+      "type": "board",
+      "read_only": false,
+      "group_by_field_id": "transaction_type",
+      "sort_dir": "desc",
+      "sort_field_id": "date",
+      "opts": {}
+    },
+    {
+      "id": "VYNAB002",
+      "shown": true,
+      "icon": "ti-receipt",
+      "label": "Receipts",
+      "description": "Transactions with receipt uploads",
+      "field_ids": [
+        "date",
+        "payee",
+        "amount",
+        "category",
+        "memo",
+        "receipt",
+        "cleared"
+      ],
+      "type": "table",
+      "read_only": false,
+      "group_by_field_id": null,
+      "sort_dir": "desc",
+      "sort_field_id": "date",
+      "opts": {}
+    }
+  ]
+}
