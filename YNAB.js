@@ -4,6 +4,320 @@
 // icon: ti-coin
 // ==/Plugin==
 
+
+
+// @generated BEGIN thymer-ext-path-b (source: plugins/plugin-settings/ThymerExtPathBRuntime.js — edit that file, then npm run embed-path-b)
+/**
+ * ThymerExtPathB — shared path-B storage (Plugin Settings collection + localStorage mirror).
+ * Edit this file in the repo, then run `npm run embed-path-b` to refresh embedded copies inside each Path B plugin.
+ *
+ * API: ThymerExtPathB.init({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
+ *      ThymerExtPathB.scheduleFlush(plugin, mirrorKeys)
+ *      ThymerExtPathB.openStorageDialog(plugin, { pluginId, modeKey, mirrorKeys, label, data, ui })
+ */
+(function pathBRuntime(g) {
+  if (g.ThymerExtPathB) return;
+
+  const COL_NAME = 'Plugin Settings';
+  const q = [];
+  let busy = false;
+
+  function drain() {
+    if (busy || !q.length) return;
+    busy = true;
+    const job = q.shift();
+    Promise.resolve(typeof job === 'function' ? job() : job)
+      .catch((e) => console.error('[ThymerExtPathB]', e))
+      .finally(() => {
+        busy = false;
+        if (q.length) setTimeout(drain, 450);
+      });
+  }
+
+  function enqueue(job) {
+    q.push(job);
+    drain();
+  }
+
+  async function findColl(data) {
+    try {
+      const all = await data.getAllCollections();
+      return all.find((c) => (c.getName?.() || '') === COL_NAME) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function readDoc(data, pluginId) {
+    const coll = await findColl(data);
+    if (!coll) return null;
+    let records;
+    try {
+      records = await coll.getAllRecords();
+    } catch (_) {
+      return null;
+    }
+    const r = records.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+    if (!r) return null;
+    let raw = '';
+    try {
+      raw = r.text?.('settings_json') || '';
+    } catch (_) {}
+    if (!raw || !String(raw).trim()) return null;
+    try {
+      return JSON.parse(raw);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function writeDoc(data, pluginId, doc) {
+    const coll = await findColl(data);
+    if (!coll) return;
+    const json = JSON.stringify(doc);
+    let records;
+    try {
+      records = await coll.getAllRecords();
+    } catch (_) {
+      return;
+    }
+    let r = records.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+    if (!r) {
+      let guid = null;
+      try {
+        guid = coll.createRecord?.(pluginId);
+      } catch (_) {}
+      if (guid) {
+        for (let i = 0; i < 30; i++) {
+          await new Promise((res) => setTimeout(res, i < 8 ? 100 : 200));
+          try {
+            const again = await coll.getAllRecords();
+            r = again.find((x) => x.guid === guid) || again.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+            if (r) break;
+          } catch (_) {}
+        }
+      }
+    }
+    if (!r) return;
+    try {
+      const pId = r.prop?.('plugin_id');
+      if (pId && typeof pId.set === 'function') pId.set(pluginId);
+    } catch (_) {}
+    try {
+      const pj = r.prop?.('settings_json');
+      if (pj && typeof pj.set === 'function') pj.set(json);
+    } catch (_) {}
+  }
+
+  function showFirstRunDialog(ui, label, preferred, onPick) {
+    const id = 'thymerext-pathb-first-' + Math.random().toString(36).slice(2);
+    const box = document.createElement('div');
+    box.id = id;
+    box.style.cssText =
+      'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:16px;';
+    const card = document.createElement('div');
+    card.style.cssText =
+      'max-width:420px;width:100%;background:var(--panel-bg-color,#1d1915);border:1px solid var(--border-default,#3f3f46);border-radius:12px;padding:20px;box-shadow:0 8px 32px rgba(0,0,0,0.5);';
+    const title = document.createElement('div');
+    title.textContent = label + ' — where to store settings?';
+    title.style.cssText = 'font-weight:700;font-size:15px;margin-bottom:10px;';
+    const hint = document.createElement('div');
+    hint.textContent = 'Change later via Command Palette → “Storage location…”';
+    hint.style.cssText = 'font-size:12px;color:var(--text-muted,#888);margin-bottom:16px;line-height:1.45;';
+    const mk = (t, sub, prim) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.style.cssText =
+        'display:block;width:100%;text-align:left;padding:12px 14px;margin-bottom:10px;border-radius:8px;cursor:pointer;font-size:14px;border:1px solid var(--border-default,#3f3f46);background:' +
+        (prim ? 'rgba(167,139,250,0.25)' : 'transparent') +
+        ';color:inherit;';
+      const x = document.createElement('div');
+      x.textContent = t;
+      x.style.fontWeight = '600';
+      b.appendChild(x);
+      if (sub) {
+        const s = document.createElement('div');
+        s.textContent = sub;
+        s.style.cssText = 'font-size:11px;opacity:0.75;margin-top:4px;line-height:1.35;';
+        b.appendChild(s);
+      }
+      return b;
+    };
+    const bLoc = mk('This device only', 'Browser localStorage only.', preferred === 'local');
+    const bSyn = mk('Sync via Plugin Settings', 'Workspace collection “' + COL_NAME + '”.', preferred === 'synced');
+    const fin = (m) => {
+      try {
+        box.remove();
+      } catch (_) {}
+      onPick(m);
+    };
+    bLoc.addEventListener('click', () => fin('local'));
+    bSyn.addEventListener('click', () => fin('synced'));
+    card.appendChild(title);
+    card.appendChild(hint);
+    card.appendChild(bLoc);
+    card.appendChild(bSyn);
+    box.appendChild(card);
+    document.body.appendChild(box);
+  }
+
+  g.ThymerExtPathB = {
+    COL_NAME,
+    enqueue,
+    async init(opts) {
+      const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
+      let mode = null;
+      try {
+        mode = localStorage.getItem(modeKey);
+      } catch (_) {}
+
+      const remote = await readDoc(data, pluginId);
+      if (!mode && remote && (remote.storageMode === 'synced' || remote.storageMode === 'local')) {
+        mode = remote.storageMode;
+        try {
+          localStorage.setItem(modeKey, mode);
+        } catch (_) {}
+      }
+
+      if (!mode) {
+        const coll = await findColl(data);
+        const preferred = coll ? 'synced' : 'local';
+        await new Promise((outerResolve) => {
+          enqueue(async () => {
+            const picked = await new Promise((r) => {
+              showFirstRunDialog(ui, label, preferred, r);
+            });
+            try {
+              localStorage.setItem(modeKey, picked);
+            } catch (_) {}
+            outerResolve(picked);
+          });
+        });
+        try {
+          mode = localStorage.getItem(modeKey);
+        } catch (_) {}
+      }
+
+      plugin._pathBMode = mode === 'synced' ? 'synced' : 'local';
+      plugin._pathBPluginId = pluginId;
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+
+      if (plugin._pathBMode === 'synced' && remote && remote.payload && typeof remote.payload === 'object') {
+        for (const k of keys) {
+          const v = remote.payload[k];
+          if (typeof v === 'string') {
+            try {
+              localStorage.setItem(k, v);
+            } catch (_) {}
+          }
+        }
+      }
+
+      if (plugin._pathBMode === 'synced') {
+        try {
+          await g.ThymerExtPathB.flushNow(data, pluginId, keys);
+        } catch (_) {}
+      }
+    },
+
+    scheduleFlush(plugin, mirrorKeys) {
+      if (plugin._pathBMode !== 'synced') return;
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      if (plugin._pathBFlushTimer) clearTimeout(plugin._pathBFlushTimer);
+      plugin._pathBFlushTimer = setTimeout(() => {
+        plugin._pathBFlushTimer = null;
+        const data = plugin.data;
+        const pid = plugin._pathBPluginId;
+        if (!pid || !data) return;
+        g.ThymerExtPathB.flushNow(data, pid, keys).catch((e) => console.error('[ThymerExtPathB] flush', e));
+      }, 500);
+    },
+
+    async flushNow(data, pluginId, mirrorKeys) {
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      const payload = {};
+      for (const k of keys) {
+        try {
+          const v = localStorage.getItem(k);
+          if (v !== null) payload[k] = v;
+        } catch (_) {}
+      }
+      const doc = {
+        v: 1,
+        storageMode: 'synced',
+        updatedAt: new Date().toISOString(),
+        payload,
+      };
+      await writeDoc(data, pluginId, doc);
+    },
+
+    async openStorageDialog(opts) {
+      const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
+      const cur = plugin._pathBMode === 'synced' ? 'synced' : 'local';
+      const pick = await new Promise((resolve) => {
+        const close = (v) => {
+          try {
+            box.remove();
+          } catch (_) {}
+          resolve(v);
+        };
+        const box = document.createElement('div');
+        box.style.cssText =
+          'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:16px;';
+        box.addEventListener('click', (e) => {
+          if (e.target === box) close(null);
+        });
+        const card = document.createElement('div');
+        card.style.cssText =
+          'max-width:400px;width:100%;background:var(--panel-bg-color,#1d1915);border:1px solid var(--border-default,#3f3f46);border-radius:12px;padding:18px;';
+        card.addEventListener('click', (e) => e.stopPropagation());
+        const t = document.createElement('div');
+        t.textContent = label + ' — storage';
+        t.style.cssText = 'font-weight:700;margin-bottom:12px;';
+        const b1 = document.createElement('button');
+        b1.type = 'button';
+        b1.textContent = 'This device only';
+        const b2 = document.createElement('button');
+        b2.type = 'button';
+        b2.textContent = 'Sync via Plugin Settings';
+        [b1, b2].forEach((b) => {
+          b.style.cssText =
+            'display:block;width:100%;padding:10px 12px;margin-bottom:8px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;text-align:left;';
+        });
+        b1.addEventListener('click', () => close('local'));
+        b2.addEventListener('click', () => close('synced'));
+        const bx = document.createElement('button');
+        bx.type = 'button';
+        bx.textContent = 'Cancel';
+        bx.style.cssText =
+          'margin-top:8px;padding:8px 14px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;';
+        bx.addEventListener('click', () => close(null));
+        card.appendChild(t);
+        card.appendChild(b1);
+        card.appendChild(b2);
+        card.appendChild(bx);
+        box.appendChild(card);
+        document.body.appendChild(box);
+      });
+      if (!pick || pick === cur) return;
+      try {
+        localStorage.setItem(modeKey, pick);
+      } catch (_) {}
+      plugin._pathBMode = pick === 'synced' ? 'synced' : 'local';
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      if (pick === 'synced') await g.ThymerExtPathB.flushNow(data, pluginId, keys);
+      ui.addToaster?.({
+        title: label,
+        message: 'Storage: ' + (pick === 'synced' ? 'synced' : 'local only'),
+        dismissible: true,
+        autoDestroyTime: 3500,
+      });
+    },
+  };
+
+})(typeof globalThis !== 'undefined' ? globalThis : window);
+// @generated END thymer-ext-path-b
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -63,9 +377,15 @@ const DEFAULT_EXCLUDED = [
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ls      = k    => { try { return localStorage.getItem(k); } catch { return null; } };
-const lsSet   = (k,v)=> { try { localStorage.setItem(k, String(v)); } catch {} };
+function ynabPathBFlush() {
+  try {
+    const p = globalThis.__ynabPathBPlugin;
+    if (p) globalThis.ThymerExtPathB?.scheduleFlush?.(p, () => Object.values(SK));
+  } catch (_) {}
+}
+const lsSet   = (k,v)=> { try { localStorage.setItem(k, String(v)); } catch {} ynabPathBFlush(); };
 const lsJson  = (k,d)=> { try { const v = ls(k); return v ? JSON.parse(v) : d; } catch { return d; } };
-const lsJsonSet=(k,v)=> { try { lsSet(k, JSON.stringify(v)); } catch {} };
+const lsJsonSet=(k,v)=> { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} ynabPathBFlush(); };
 const sleep   = ms   => new Promise(r => setTimeout(r, ms));
 
 function fmt(n) {
@@ -81,6 +401,25 @@ function journalDateFromGuid(guid) {
   const day   = parseInt(s.slice(6, 8), 10);
   if (year < 2000 || year > 2099 || month < 1 || month > 12 || day < 1 || day > 31) return null;
   return { year, month, day, yyyymmdd: s };
+}
+
+/** Same shape as journalDateFromGuid; falls back to journal details when GUID suffix is not YYYYMMDD. */
+function journalDateFromRecord(record) {
+  if (!record) return null;
+  const fromGuid = journalDateFromGuid(record.guid);
+  if (fromGuid) return fromGuid;
+  try {
+    const jd = record.getJournalDetails?.();
+    const d = jd?.date;
+    if (d instanceof Date && !isNaN(d.getTime())) {
+      const year = d.getFullYear();
+      const month = d.getMonth() + 1;
+      const day = d.getDate();
+      const yyyymmdd = `${year}${String(month).padStart(2, '0')}${String(day).padStart(2, '0')}`;
+      return { year, month, day, yyyymmdd };
+    }
+  } catch {}
+  return null;
 }
 
 // Returns YYYY-MM-DD string
@@ -798,16 +1137,27 @@ const CSS = `
 class Plugin extends CollectionPlugin {
 
   async onLoad() {
+    globalThis.__ynabPathBPlugin = this;
+    await (globalThis.ThymerExtPathB?.init?.({
+      plugin: this,
+      pluginId: 'ynab',
+      modeKey: 'thymerext_ps_mode_ynab',
+      mirrorKeys: () => Object.values(SK),
+      label: 'YNAB',
+      data: this.data,
+      ui: this.ui,
+    }) ?? (console.warn('[YNAB] ThymerExtPathB runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
     this._panelStates    = new Map();
     this._eventIds       = [];
     this._chartInstances = new Map();
+    this._ynNavTimers    = new Map();
 
     // Note: versioned cache keys (v4) mean old-format data auto-expires
     // without needing to manually bust the cache on every load
     this.ui.injectCSS(CSS);
     this.views.register('Dashboard', ctx => this._dashboardView(ctx));
 
-    this._eventIds.push(this.events.on('panel.navigated', ev => this._handlePanel(ev.panel)));
+    this._eventIds.push(this.events.on('panel.navigated', ev => this._deferHandlePanel(ev.panel)));
     this._eventIds.push(this.events.on('panel.focused',   ev => this._handlePanel(ev.panel)));
     this._eventIds.push(this.events.on('panel.closed',    ev => this._disposePanel(ev.panel?.getId?.())));
 
@@ -819,6 +1169,21 @@ class Plugin extends CollectionPlugin {
       label: 'YNAB: Configure Token & Budget', icon: 'ti-settings',
       onSelected: () => this._showConfigDialog(),
     });
+    this._cmdStorage = this.ui.addCommandPaletteCommand({
+      label: 'YNAB: Storage location…',
+      icon: 'ti-database',
+      onSelected: () => {
+        globalThis.ThymerExtPathB?.openStorageDialog?.({
+          plugin: this,
+          pluginId: 'ynab',
+          modeKey: 'thymerext_ps_mode_ynab',
+          mirrorKeys: () => Object.values(SK),
+          label: 'YNAB',
+          data: this.data,
+          ui: this.ui,
+        });
+      },
+    });
 
     setTimeout(() => { const p = this.ui.getActivePanel(); if (p) this._handlePanel(p); }, 400);
     // No auto-sync on load — sync is manual only (avoids freezing on large budgets)
@@ -827,8 +1192,11 @@ class Plugin extends CollectionPlugin {
   onUnload() {
     for (const id of (this._eventIds || [])) { try { this.events.off(id); } catch {} }
     this._eventIds = [];
+    for (const t of (this._ynNavTimers || new Map()).values()) { try { clearTimeout(t); } catch {} }
+    this._ynNavTimers?.clear();
     this._cmdSync?.remove?.();
     this._cmdCfg?.remove?.();
+    this._cmdStorage?.remove?.();
     for (const [pid] of (this._panelStates || new Map())) this._disposePanel(pid);
     this._panelStates?.clear();
     for (const [, ch] of (this._chartInstances || new Map())) { try { ch.destroy(); } catch {} }
@@ -985,13 +1353,20 @@ class Plugin extends CollectionPlugin {
       const wagesAmt = rangeTxns.filter(t=>t.type==='expense' && /wages/i.test(t.category_group)).reduce((a,t)=>a+Math.abs(t.amount),0);
       const drawAmt  = rangeTxns.filter(t=>t.type==='expense' && /owner.*draw|draw.*owner/i.test(t.category_group)).reduce((a,t)=>a+Math.abs(t.amount),0);
 
-      // Stat cards
-      statsEl.innerHTML='';
-      statsEl.append(
+      // Stat cards — main 3 cards in flex row
+      const cardsRow = document.createElement('div');
+      cardsRow.style.display = 'flex';
+      cardsRow.style.gap = '12px';
+      cardsRow.style.flexWrap = 'wrap';
+      cardsRow.style.marginBottom = '12px';
+      cardsRow.style.width = '100%';
+      cardsRow.append(
         this._bigCard('Income', incomeAmt, 'inc'),
         this._bigCard('Expenses', expenseAmt, 'exp'),
         this._bigCard('Net', net, net>=0?'net-pos':'net-neg'),
       );
+      statsEl.innerHTML = '';
+      statsEl.appendChild(cardsRow);
 
       // Secondary row — Wages + Draw, always visible regardless of filters
       secondaryEl.innerHTML='';
@@ -1169,63 +1544,162 @@ class Plugin extends CollectionPlugin {
 
   // ── Journal widget ───────────────────────────────────────────────────────────
 
+  _deferHandlePanel(panel) {
+    const panelId = panel?.getId?.();
+    if (!panelId) return;
+    const prev = this._ynNavTimers.get(panelId);
+    if (prev) clearTimeout(prev);
+    this._ynNavTimers.set(panelId, setTimeout(() => {
+      this._ynNavTimers.delete(panelId);
+      this._handlePanel(panel);
+    }, 400));
+  }
+
   _handlePanel(panel) {
     const panelId = panel?.getId?.();
     if (!panelId) return;
     const navType = panel?.getNavigation?.()?.type || '';
     if (navType === 'custom' || navType === 'custom_panel') { this._disposePanel(panelId); return; }
+
     const panelEl = panel?.getElement?.();
-    const record  = panel?.getActiveRecord?.();
+    if (!panelEl) { this._disposePanel(panelId); return; }
+
+    const container = this._findContainer(panelEl);
+    if (!container) {
+      let state = this._panelStates.get(panelId);
+      if (!state) {
+        state = {
+          panelId, panel,
+          recordGuid: null,
+          yyyymmdd: null, year: null, month: null, day: null,
+          rootEl: null, observer: null, loaded: false, loading: false,
+          _pendingPopulateWidget: false,
+          _containerWatcher: null,
+        };
+        this._panelStates.set(panelId, state);
+        state._containerWatcher = new MutationObserver(() => {
+          if (this._findContainer(panelEl)) {
+            try { state._containerWatcher?.disconnect(); } catch {}
+            state._containerWatcher = null;
+            this._handlePanel(panel);
+          }
+        });
+        try {
+          state._containerWatcher.observe(panelEl, { childList: true, subtree: true });
+        } catch (_) {
+          state._containerWatcher = null;
+          this._disposePanel(panelId);
+        }
+      }
+      return;
+    }
+
+    const record = panel?.getActiveRecord?.();
     if (!record) { this._disposePanel(panelId); return; }
-    const jd = journalDateFromGuid(record.guid);
+    const jd = journalDateFromRecord(record);
     if (!jd) { this._disposePanel(panelId); return; }
 
     let state = this._panelStates.get(panelId);
-    const changed = state?.yyyymmdd !== jd.yyyymmdd;
-    if (!state) {
-      state = { panelId, panel, ...jd, rootEl: null, observer: null, loaded: false, loading: false };
-      this._panelStates.set(panelId, state);
-    } else { Object.assign(state, { panel, ...jd }); }
+    const wasPlaceholder = state && (state.recordGuid == null || state.yyyymmdd == null);
+    const dateChanged = state != null && state.yyyymmdd != null && state.yyyymmdd !== jd.yyyymmdd;
+    const recordChanged = state != null && state.recordGuid != null && state.recordGuid !== record.guid;
 
-    this._mountWidget(state, panelEl);
-    if (changed || !state.loaded) this._populateWidget(state);
+    if (!state) {
+      state = {
+        panelId, panel, recordGuid: record.guid, ...jd,
+        rootEl: null, observer: null, loaded: false, loading: false,
+        _pendingPopulateWidget: false,
+        _containerWatcher: null,
+      };
+      this._panelStates.set(panelId, state);
+    } else {
+      try { state._containerWatcher?.disconnect(); } catch {}
+      state._containerWatcher = null;
+      Object.assign(state, { panel, recordGuid: record.guid, ...jd });
+      if (dateChanged || recordChanged || wasPlaceholder) state.loaded = false;
+    }
+
+    const rebuilt = this._mountWidget(state, container, panelEl);
+    if (rebuilt) state.loading = false;
+
+    const needPopulate = dateChanged || recordChanged || wasPlaceholder || !state.loaded || rebuilt;
+    if (needPopulate) {
+      if (state.loading) state._pendingPopulateWidget = true;
+      else this._populateWidget(state);
+    }
   }
 
   _disposePanel(panelId) {
     if (!panelId) return;
+    const nt = this._ynNavTimers?.get(panelId);
+    if (nt) { try { clearTimeout(nt); } catch {} this._ynNavTimers.delete(panelId); }
     const s = this._panelStates.get(panelId);
     if (!s) return;
     try { s.observer?.disconnect(); } catch {}
+    try { s._containerWatcher?.disconnect(); } catch {}
+    try { clearTimeout(s._navTimer); } catch {}
     try { s.rootEl?.remove(); }       catch {}
     const ch = this._chartInstances.get(panelId);
     if (ch) { try { ch.destroy(); } catch {} this._chartInstances.delete(panelId); }
     this._panelStates.delete(panelId);
   }
 
-  _mountWidget(state, panelEl) {
-    if (!state.rootEl || !state.rootEl.isConnected) state.rootEl = this._buildWidget(state);
-    const container = this._findContainer(panelEl);
-    if (!container) return;
-    if (state.rootEl.parentElement !== container || container.firstChild !== state.rootEl) {
-      container.insertBefore(state.rootEl, container.firstChild);
+  /** Returns true if the widget DOM was rebuilt — caller should re-populate and cancel stale async work. */
+  _mountWidget(state, container, panelEl) {
+    const correctlyPlaced = state.rootEl && state.rootEl.isConnected
+      && state.rootEl.parentElement === container
+      && container.firstChild === state.rootEl;
+    if (correctlyPlaced) {
+      if (!state.observer) state.observer = this._createWidgetObserver(state, panelEl);
+      return false;
     }
-    if (!state.observer) {
-      state.observer = new MutationObserver(() => {
-        if (!state.rootEl?.isConnected) { setTimeout(() => this._mountWidget(state, panelEl), 0); }
-        else if (state.rootEl.parentElement === container && container.firstChild !== state.rootEl) {
-          container.insertBefore(state.rootEl, container.firstChild);
-        }
-      });
-      state.observer.observe(panelEl, { childList: true, subtree: true });
+
+    if (state.observer) {
+      try { state.observer.disconnect(); } catch {}
+      state.observer = null;
     }
+    try { clearTimeout(state._navTimer); } catch {}
+
+    const ch0 = this._chartInstances.get(state.panelId);
+    if (ch0) { try { ch0.destroy(); } catch {} this._chartInstances.delete(state.panelId); }
+
+    for (const el of container.querySelectorAll(':scope > .ynab-widget')) {
+      if (el.dataset?.panelId === state.panelId) { try { el.remove(); } catch {} }
+    }
+
+    state.rootEl = this._buildWidget(state);
+    container.insertBefore(state.rootEl, container.firstChild);
+
+    state.observer = this._createWidgetObserver(state, panelEl);
+    return true;
   }
 
+  _createWidgetObserver(state, panelEl) {
+    const obs = new MutationObserver(() => {
+      const c = this._findContainer(panelEl);
+      if (state.rootEl && c && state.rootEl.isConnected && state.rootEl.parentElement === c && c.firstChild !== state.rootEl) {
+        c.insertBefore(state.rootEl, c.firstChild);
+      }
+      if (state.rootEl && !state.rootEl.isConnected) {
+        try { clearTimeout(state._navTimer); } catch {}
+        state._navTimer = setTimeout(() => {
+          if (state.panel && state.rootEl && !state.rootEl.isConnected) {
+            this._handlePanel(state.panel);
+          }
+        }, 300);
+      }
+    });
+    obs.observe(panelEl, { childList: true, subtree: true });
+    return obs;
+  }
+
+  /** Prefer the last match — after journal navigation Thymer may leave multiple layers; first match can be stale. */
   _findContainer(panelEl) {
     if (!panelEl) return null;
     for (const sel of ['.page-content', '.editor-wrapper', '.editor-panel', '#editor']) {
       if (panelEl.matches?.(sel)) return panelEl;
-      const c = panelEl.querySelector?.(sel);
-      if (c) return c;
+      const all = panelEl.querySelectorAll?.(sel);
+      if (all && all.length) return all[all.length - 1];
     }
     return null;
   }
@@ -1237,8 +1711,8 @@ class Plugin extends CollectionPlugin {
 
     // Header
     const header = document.createElement('div'); header.className = 'ynab-widget-header';
-    const toggle = document.createElement('button'); toggle.type='button'; toggle.className='ynab-w-toggle'; toggle.textContent = collapsed ? '+' : '−';
-    const title  = document.createElement('span');  title.className='ynab-w-title'; title.textContent = '💰 YNAB Income';
+    const toggle = document.createElement('button'); toggle.type='button'; toggle.className='ynab-w-toggle'; toggle.innerHTML = collapsed ? '<i class="ti ti-chevron-down"></i>' : '<i class="ti ti-chevron-up"></i>';
+    const title  = document.createElement('span');  title.className='ynab-w-title'; title.innerHTML = '<i class="ti ti-coin"></i> YNAB Income';
 
     const controls = document.createElement('div'); controls.className='ynab-w-controls'; controls.style.display = collapsed ? 'none' : 'flex';
     const period = ls(SK.WIDGET_PERIOD) || 'weekly';
@@ -1253,7 +1727,7 @@ class Plugin extends CollectionPlugin {
       const nowCollapsed = body.style.display !== 'none';
       body.style.display     = nowCollapsed ? 'none' : 'block';
       controls.style.display = nowCollapsed ? 'none' : 'flex';
-      toggle.textContent     = nowCollapsed ? '+' : '−';
+      toggle.innerHTML       = nowCollapsed ? '<i class="ti ti-chevron-down"></i>' : '<i class="ti ti-chevron-up"></i>';
       lsSet(SK.WIDGET_COLLAPSE, nowCollapsed);
     });
     header.append(toggle, title, controls);
@@ -1321,9 +1795,29 @@ class Plugin extends CollectionPlugin {
 
   // ── Widget data & chart ─────────────────────────────────────────────────────
 
+  _finishWidgetPopulate(state) {
+    if (!state) return;
+    state.loading = false;
+    if (state._pendingPopulateWidget) {
+      state._pendingPopulateWidget = false;
+      this._populateWidget(state);
+    }
+  }
+
   async _populateWidget(state) {
-    if (!state || state.loading || !ls(SK.TOKEN) || !ls(SK.BUDGET_ID)) return;
+    if (!state) return;
+    if (!ls(SK.TOKEN) || !ls(SK.BUDGET_ID)) {
+      state.loading = false;
+      state._pendingPopulateWidget = false;
+      return;
+    }
+    if (state.loading) {
+      state._pendingPopulateWidget = true;
+      return;
+    }
     state.loading = true;
+
+    const snapY = state.year, snapM = state.month, snapD = state.day;
 
     const root      = state.rootEl;
     const statsEl   = root?.querySelector('[data-role="stats"]');
@@ -1335,7 +1829,11 @@ class Plugin extends CollectionPlugin {
     try {
       await loadChartJs();
       const txns    = await getTransactions();
-      if (!root?.isConnected) { state.loading = false; return; }
+      if (state.year !== snapY || state.month !== snapM || state.day !== snapD) {
+        this._finishWidgetPopulate(state);
+        return;
+      }
+      if (!root?.isConnected) { this._finishWidgetPopulate(state); return; }
 
       const isIncome = t => isIncomeTransaction(t, txns);
       const filtered = txns.filter(t => isIncome(t));
@@ -1428,11 +1926,13 @@ class Plugin extends CollectionPlugin {
 
     } catch (e) {
       console.error('[YNAB widget]', e);
-      if (statusEl) statusEl.textContent = `Error: ${e.message}`;
+      if (statusEl && state.year === snapY && state.month === snapM && state.day === snapD) {
+        statusEl.textContent = `Error: ${e.message}`;
+      }
     }
 
-    state.loading = false;
-    state.loaded  = true;
+    state.loaded = true;
+    this._finishWidgetPopulate(state);
   }
 
   _chip(label, amount, mod='') {

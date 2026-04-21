@@ -1,7 +1,7 @@
 # YNAB Business Income/Expense Tracking in Thymer
 YNAB dashboard, income chart on journal pages, transaction sync
 
-‼️ _In progress. Created by Claude and someone who knows nothing about coding! Suggestions and support very welcome!_ ‼️
+‼️ In progress. Created by AI, vibes, and someone who knows nothing about coding! Suggestions and support very welcome! ‼️
 
 
 
@@ -17,6 +17,15 @@ A comprehensive financial dashboard plugin that brings your YNAB budget into Thy
 - 📋 **Multiple Views** — Dashboard, Income vs Expenses board, and Receipts table
 - ⚙️ **Smart Filtering** — Choose exactly which payees count as income and which expense categories to track
 - 📱 **Journal Integration** — Income chart appears automatically above Properties on journal pages
+- 💾 **Storage Mode** — Command Palette `YNAB: Storage location…` supports local-only or synced settings
+
+## Recent sync updates
+
+- Added embedded Path B runtime for synced settings support.
+- Added `YNAB: Storage location…` command.
+- Improved journal panel repopulation/navigation behavior.
+- Manual sync remains explicit (`Sync Now` / command), no auto-sync on load.
+- Updated collection JSON to full plugin schema format (`ver`, `name`, views, metadata).
 
 ## Prerequisites
 
@@ -73,6 +82,14 @@ You'll see a confirmation: "Token and budget saved."
 2. Click the **Sync Now** button (⟳ icon, top right)
 3. Wait for the sync to complete (may take a few seconds for large budgets)
 4. Your transactions will appear in the collection
+
+### Optional: Choose settings storage mode
+
+1. Open Command Palette (Cmd/Ctrl + K)
+2. Run **`YNAB: Storage location…`**
+3. Choose:
+   - **This device only** (localStorage)
+   - **Sync via Plugin Settings** (workspace-synced)
 
 ## Usage
 
