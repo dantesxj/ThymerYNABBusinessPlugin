@@ -53,14 +53,14 @@ A comprehensive financial dashboard plugin that brings your YNAB budget into Thy
 2. Create a new collection called **`YNAB`**
 3. Go to **Settings** (gear icon on the collection)
 4. Click **Edit as Code** → **Configuration** tab
-5. Delete any existing content and paste the entire contents of **`YNAB.json`**
+5. Delete any existing content and paste the entire contents of **`plugin.json`**
 6. Click **Save** (you should see "Configuration updated")
 
 ### Step 3: Install the Plugin Code
 
 1. Still in **Settings** → **Edit as Code**
 2. Go to the **Custom Code** tab
-3. Delete any existing content and paste the entire contents of **`YNAB.js`**
+3. Delete any existing content and paste the entire contents of **`plugin.js`**
 4. Click **Save** (you should see "Code compiled")
 5. Click **Reload** (Thymer will refresh)
 
