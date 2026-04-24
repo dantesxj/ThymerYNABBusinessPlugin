@@ -89,7 +89,7 @@ You'll see a confirmation: "Token and budget saved."
 2. Run **`YNAB: Storage location…`**
 3. Choose:
    - **This device only** (localStorage)
-   - **Sync via Plugin Settings** (workspace-synced)
+   - **Sync via Plugin Backend** (workspace-synced)
 
 ## Usage
 
