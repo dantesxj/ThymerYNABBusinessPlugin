@@ -6,7 +6,7 @@
 	"home": false,
 	"page_field_ids": [],
 	"item_name": "Transaction",
-	"description": "Sync YNAB Transactions with Dashboard & Journal Income Panel",
+	"description": "Sync YNAB Transactions with Dashboard and collection views",
 	"show_sidebar_items": true,
 	"show_cmdpal_items": true,
 	"fields": [
