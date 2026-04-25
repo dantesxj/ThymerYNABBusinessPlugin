@@ -818,6 +818,125 @@
     return s;
   }
 
+  /** Configured collection name only (avoids duplicating `collectionDisplayName` fallbacks). */
+  function collectionBackendConfiguredTitle(c) {
+    if (!c) return '';
+    try {
+      return String(c.getConfiguration?.()?.name || '').trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /**
+   * When plugin iframes are opaque (blob/sandbox), `navigator.locks` and `window.top` globals do not
+   * dedupe across realms. First `localStorage` we can reach on the Thymer app origin is shared.
+   */
+  function getSharedThymerLocalStorage() {
+    const seen = new Set();
+    const tryWin = (w) => {
+      if (!w || seen.has(w)) return null;
+      seen.add(w);
+      try {
+        const ls = w.localStorage;
+        void ls.length;
+        return ls;
+      } catch (_) {
+        return null;
+      }
+    };
+    try {
+      const t = tryWin(window.top);
+      if (t) return t;
+    } catch (_) {}
+    try {
+      const t = tryWin(window);
+      if (t) return t;
+    } catch (_) {}
+    try {
+      let w = window;
+      for (let i = 0; i < 10 && w; i++) {
+        const t = tryWin(w);
+        if (t) return t;
+        if (w === w.parent) break;
+        w = w.parent;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  const LS_CREATE_LEASE_KEY = 'thymerext_plugin_backend_create_lease_v1';
+
+  /**
+   * Cross-realm mutex for `createCollection` + first `saveConfiguration` only.
+   * @returns {{ denied: boolean, release: () => void }}
+   */
+  async function acquirePluginBackendCreationLease(maxWaitMs) {
+    const noop = { denied: false, release() {} };
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return noop;
+    const holder =
+      (typeof crypto !== 'undefined' && crypto.randomUUID && crypto.randomUUID()) ||
+      `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    const deadline = Date.now() + (Number(maxWaitMs) > 0 ? maxWaitMs : 12000);
+    let acquired = false;
+    let sawContention = false;
+    while (Date.now() < deadline) {
+      try {
+        const raw = ls.getItem(LS_CREATE_LEASE_KEY);
+        let busy = false;
+        if (raw) {
+          let j = null;
+          try {
+            j = JSON.parse(raw);
+          } catch (_) {
+            j = null;
+          }
+          if (j && typeof j.exp === 'number' && j.h !== holder && j.exp > Date.now()) busy = true;
+        }
+        if (busy) {
+          sawContention = true;
+          await new Promise((r) => setTimeout(r, 40 + Math.floor(Math.random() * 70)));
+          continue;
+        }
+        const exp = Date.now() + 45000;
+        const payload = JSON.stringify({ h: holder, exp });
+        ls.setItem(LS_CREATE_LEASE_KEY, payload);
+        await new Promise((r) => setTimeout(r, 0));
+        if (ls.getItem(LS_CREATE_LEASE_KEY) === payload) {
+          acquired = true;
+          if (DEBUG_COLLECTIONS) dlogPathB('lease_acquired', { via: 'localStorage', sawContention });
+          break;
+        }
+      } catch (_) {
+        return noop;
+      }
+      await new Promise((r) => setTimeout(r, 30 + Math.floor(Math.random() * 50)));
+    }
+    if (!acquired) {
+      if (DEBUG_COLLECTIONS) dlogPathB('lease_timeout_abort_create', { sawContention });
+      return { denied: true, release() {} };
+    }
+    return {
+      denied: false,
+      release() {
+        if (!acquired) return;
+        acquired = false;
+        try {
+          const cur = ls.getItem(LS_CREATE_LEASE_KEY);
+          if (!cur) return;
+          let j = null;
+          try {
+            j = JSON.parse(cur);
+          } catch (_) {
+            return;
+          }
+          if (j && j.h === holder) ls.removeItem(LS_CREATE_LEASE_KEY);
+        } catch (_) {}
+      },
+    };
+  }
+
   /** When Thymer omits names on `getAllCollections()` entries, match our Path B schema. */
   function pathBCollectionScore(c) {
     if (!c) return 0;
@@ -854,7 +973,8 @@
     if (!cands.length) return null;
     const named = cands.find((c) => {
       const n = collectionDisplayName(c);
-      return n === COL_NAME || n === COL_NAME_LEGACY;
+      const cfg = collectionBackendConfiguredTitle(c);
+      return n === COL_NAME || n === COL_NAME_LEGACY || cfg === COL_NAME || cfg === COL_NAME_LEGACY;
     });
     return named || cands[0];
   }
@@ -866,6 +986,8 @@
         return (
           list.find((c) => collectionDisplayName(c) === COL_NAME) ||
           list.find((c) => collectionDisplayName(c) === COL_NAME_LEGACY) ||
+          list.find((c) => collectionBackendConfiguredTitle(c) === COL_NAME) ||
+          list.find((c) => collectionBackendConfiguredTitle(c) === COL_NAME_LEGACY) ||
           null
         );
       };
@@ -888,6 +1010,8 @@
     for (const c of all) {
       const nm = collectionDisplayName(c);
       if (nm === COL_NAME || nm === COL_NAME_LEGACY) return true;
+      const cfg = collectionBackendConfiguredTitle(c);
+      if (cfg === COL_NAME || cfg === COL_NAME_LEGACY) return true;
     }
     return !!pickPathBCollectionHeuristic(all);
   }
@@ -1031,16 +1155,26 @@
         void 0;
       }
       if (DEBUG_COLLECTIONS) dlogPathB('ensureBody_about_to_create', { pathB: pathBWindowSnapshot() });
-      const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
-      if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
-        return;
+      const lease = await acquirePluginBackendCreationLease(14000);
+      if (lease.denied) return;
+      try {
+        if (await findColl(data)) return;
+        if (await hasPluginBackendOnWorkspace(data)) return;
+        const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
+        if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
+          return;
+        }
+        const conf = cloneShape();
+        const base = coll.getConfiguration();
+        if (base && typeof base.ver === 'number') conf.ver = base.ver;
+        const ok = await coll.saveConfiguration(conf);
+        if (ok === false) return;
+        await new Promise((r) => setTimeout(r, 250));
+      } finally {
+        try {
+          lease.release();
+        } catch (_) {}
       }
-      const conf = cloneShape();
-      const base = coll.getConfiguration();
-      if (base && typeof base.ver === 'number') conf.ver = base.ver;
-      const ok = await coll.saveConfiguration(conf);
-      if (ok === false) return;
-      await new Promise((r) => setTimeout(r, 250));
     } catch (e) {
       console.error('[ThymerPluginSettings] ensure collection', e);
     }
@@ -1530,36 +1664,6 @@ function fmt(n) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n);
 }
 
-function journalDateFromGuid(guid) {
-  if (!guid || guid.length < 8) return null;
-  const s = guid.slice(-8);
-  if (!/^\d{8}$/.test(s)) return null;
-  const year  = parseInt(s.slice(0, 4), 10);
-  const month = parseInt(s.slice(4, 6), 10);
-  const day   = parseInt(s.slice(6, 8), 10);
-  if (year < 2000 || year > 2099 || month < 1 || month > 12 || day < 1 || day > 31) return null;
-  return { year, month, day, yyyymmdd: s };
-}
-
-/** Same shape as journalDateFromGuid; falls back to journal details when GUID suffix is not YYYYMMDD. */
-function journalDateFromRecord(record) {
-  if (!record) return null;
-  const fromGuid = journalDateFromGuid(record.guid);
-  if (fromGuid) return fromGuid;
-  try {
-    const jd = record.getJournalDetails?.();
-    const d = jd?.date;
-    if (d instanceof Date && !isNaN(d.getTime())) {
-      const year = d.getFullYear();
-      const month = d.getMonth() + 1;
-      const day = d.getDate();
-      const yyyymmdd = `${year}${String(month).padStart(2, '0')}${String(day).padStart(2, '0')}`;
-      return { year, month, day, yyyymmdd };
-    }
-  } catch {}
-  return null;
-}
-
 // Returns YYYY-MM-DD string
 function dateStr(d) { return d.toISOString().slice(0, 10); }
 
@@ -1746,234 +1850,10 @@ async function getTransactions(force = false) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BUCKETING  (widget chart only)
-// ─────────────────────────────────────────────────────────────────────────────
-
-function bucketData(txns, refDate, period, compare, showAvg) {
-  // txns is expected to already be filtered to income-only transactions
-  const income = txns;
-  let labels = [], cur = [], prev = null, curTotal = 0, prevTotal = null, avg = null;
-
-  if (period === 'daily') {
-    const N = 30;
-    for (let i = N - 1; i >= 0; i--) {
-      const d = new Date(refDate); d.setDate(d.getDate() - i);
-      const k = dateStr(d);
-      labels.push(k.slice(5).replace('-', '.'));
-      cur.push(income.filter(t => t.date === k).reduce((a, t) => a + t.amount, 0));
-    }
-    curTotal = income.filter(t => t.date === dateStr(refDate)).reduce((a, t) => a + t.amount, 0);
-    if (compare) {
-      prev = [];
-      for (let i = N - 1; i >= 0; i--) {
-        const d = new Date(refDate); d.setDate(d.getDate() - i - N);
-        prev.push(income.filter(t => t.date === dateStr(d)).reduce((a, t) => a + t.amount, 0));
-      }
-      const yd = new Date(refDate); yd.setDate(yd.getDate() - 1);
-      prevTotal = income.filter(t => t.date === dateStr(yd)).reduce((a, t) => a + t.amount, 0);
-    }
-    if (showAvg) avg = cur.reduce((a, b) => a + b, 0) / cur.length;
-
-  } else if (period === 'weekly') {
-    const N = 12;
-    const wkStart = d => { const dt = new Date(d); dt.setDate(dt.getDate() - dt.getDay()); dt.setHours(0,0,0,0); return dt; }; // Sunday start, matches Coda
-    const ws = wkStart(refDate);
-    for (let i = N - 1; i >= 0; i--) {
-      const s = new Date(ws); s.setDate(s.getDate() - i*7);
-      const e = new Date(s);  e.setDate(e.getDate() + 6);
-      const wkNum = (() => {
-        const tmp = new Date(s); tmp.setHours(0,0,0,0);
-        const jan1 = new Date(tmp.getFullYear(), 0, 1);
-        return Math.ceil(((tmp - jan1) / 86400000 + jan1.getDay() + 1) / 7);
-      })();
-      const wkMMDD = dateStr(s).slice(5).replace('-', '.');
-      labels.push(`w${String(wkNum).padStart(2,'0')} · ${wkMMDD}`);
-      cur.push(income.filter(t => t.date >= dateStr(s) && t.date <= dateStr(e)).reduce((a,t)=>a+t.amount,0));
-    }
-    const wse = new Date(ws); wse.setDate(wse.getDate()+6);
-    curTotal = income.filter(t => t.date >= dateStr(ws) && t.date <= dateStr(wse)).reduce((a,t)=>a+t.amount,0);
-    if (compare) {
-      // Overlay: each bar's comparison is the equivalent week 1 year ago
-      // prevTotal: simply the week immediately before the current one
-      const lastWS = new Date(ws); lastWS.setDate(lastWS.getDate() - 7);
-      const lastWE = new Date(lastWS); lastWE.setDate(lastWE.getDate() + 6);
-      prevTotal = income.filter(t => t.date >= dateStr(lastWS) && t.date <= dateStr(lastWE)).reduce((a,t)=>a+t.amount,0);
-      // Overlay line: shift each displayed week back by exactly 1 week
-      prev = [];
-      for (let i = N - 1; i >= 0; i--) {
-        const s = new Date(ws); s.setDate(s.getDate() - i*7 - 7);
-        const e = new Date(s);  e.setDate(e.getDate()+6);
-        prev.push(income.filter(t => t.date >= dateStr(s) && t.date <= dateStr(e)).reduce((a,t)=>a+t.amount,0));
-      }
-    }
-    if (showAvg) { const nz = cur.filter(v=>v>0); avg = nz.length ? nz.reduce((a,b)=>a+b,0)/nz.length : 0; }
-
-  } else { // monthly
-    const N = 12;
-    for (let i = N - 1; i >= 0; i--) {
-      const d  = new Date(refDate.getFullYear(), refDate.getMonth()-i, 1);
-      const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
-      labels.push(d.toLocaleString('default',{month:'short',year:'2-digit'}));
-      cur.push(income.filter(t=>t.date.startsWith(key)).reduce((a,t)=>a+t.amount,0));
-    }
-    const ck = `${refDate.getFullYear()}-${String(refDate.getMonth()+1).padStart(2,'0')}`;
-    curTotal = income.filter(t=>t.date.startsWith(ck)).reduce((a,t)=>a+t.amount,0);
-    if (compare) {
-      const pd = new Date(refDate.getFullYear(), refDate.getMonth()-N, 1);
-      prev = [];
-      for (let i = 0; i < N; i++) {
-        const d = new Date(pd.getFullYear(), pd.getMonth()+i, 1);
-        const k = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
-        prev.push(income.filter(t=>t.date.startsWith(k)).reduce((a,t)=>a+t.amount,0));
-      }
-      prevTotal = prev[prev.length-1] ?? 0;
-    }
-    if (showAvg) { const nz = cur.filter(v=>v>0); avg = nz.length ? nz.reduce((a,b)=>a+b,0)/nz.length : 0; }
-  }
-
-  return { labels, cur, prev, curTotal, prevTotal, avg };
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // CSS
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CSS = `
-  /* ── Journal widget — bg matches Backreferences card exactly ── */
-  .ynab-widget {
-    background-color: ${C.cardBg};
-    border: 1px solid ${C.cardBorder};
-    border-radius: 10px;
-    padding: 10px 16px 10px;
-    margin-bottom: 12px;
-    font-size: 13px;
-    color: ${C.text};
-  }
-  .ynab-widget-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    min-height: 28px;
-  }
-  .ynab-w-toggle {
-    font-size: 13px;
-    color: ${C.statLabel};
-    cursor: pointer;
-    padding: 0 3px;
-    flex-shrink: 0;
-    background: none;
-    border: none;
-    line-height: 1;
-  }
-  .ynab-w-title {
-    font-weight: 600;
-    font-size: 13px;
-    flex-shrink: 0;
-  }
-  .ynab-w-controls {
-    display: flex;
-    gap: 5px;
-    flex-wrap: wrap;
-    margin-left: auto;
-  }
-  .ynab-tgroup {
-    display: flex;
-    gap: 2px;
-    background: rgba(255,255,255,0.05);
-    border-radius: 6px;
-    padding: 2px;
-  }
-  .ynab-tbtn {
-    background: transparent;
-    border: none;
-    color: ${C.statLabel};
-    font-size: 11px;
-    padding: 2px 7px;
-    border-radius: 4px;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: all 0.12s;
-    line-height: 1.4;
-  }
-  .ynab-tbtn:hover { color: ${C.text}; background: rgba(255,255,255,0.07); }
-  .ynab-tbtn.active {
-    background: rgba(${C.greenRgb}, 0.25);
-    color: #3d8f58;
-    font-weight: 600;
-  }
-
-  .ynab-widget-body { margin-top: 10px; }
-
-  /* Filter chips in widget */
-  .ynab-w-filter-row {
-    display: flex;
-    gap: 5px;
-    flex-wrap: wrap;
-    margin-bottom: 9px;
-    align-items: center;
-  }
-  .ynab-w-filter-label {
-    font-size: 9px;
-    text-transform: uppercase;
-    letter-spacing: 0.07em;
-    color: ${C.statLabel};
-    flex-shrink: 0;
-    margin-right: 2px;
-  }
-  .ynab-w-chip {
-    font-size: 10px;
-    padding: 2px 8px;
-    border-radius: 10px;
-    border: 1px solid rgba(${C.greenRgb}, 0.35);
-    background: rgba(${C.greenRgb}, 0.14);
-    color: #3d8f58;
-    cursor: pointer;
-    transition: all 0.12s;
-    line-height: 1.5;
-  }
-  .ynab-w-chip:hover { background: rgba(${C.greenRgb}, 0.22); }
-  .ynab-w-chip.off {
-    background: rgba(255,255,255,0.04);
-    border-color: rgba(255,255,255,0.09);
-    color: ${C.statLabel};
-    text-decoration: line-through;
-  }
-
-  .ynab-stat-row {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-bottom: 10px;
-  }
-  .ynab-stat-chip {
-    background: rgba(255,255,255,0.05);
-    border-radius: 6px;
-    padding: 4px 10px;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-  }
-  .ynab-stat-chip.pos .ynab-sv { color: #3d8f58; }
-  .ynab-stat-chip.neg .ynab-sv { color: #b84040; }
-  .ynab-sl {
-    font-size: 9px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: ${C.statLabel};
-  }
-  .ynab-sv {
-    font-size: 14px;
-    font-weight: 600;
-    color: ${C.text};
-    font-variant-numeric: tabular-nums;
-  }
-
-  .ynab-canvas-wrap { position: relative; height: 140px; margin-bottom: 5px; }
-  .ynab-status { font-size: 10px; color: ${C.statLabel}; text-align: right; font-style: italic; }
-  .ynab-notice { font-size: 12px; color: ${C.statLabel}; padding: 6px 0; font-style: italic; }
-  .ynab-cfg-link { color: #3d8f58; text-decoration: none; }
-  .ynab-cfg-link:hover { text-decoration: underline; }
-
   /* ── Dashboard ── */
   .ynab-dash {
     padding: 20px 24px;
@@ -2276,6 +2156,7 @@ class Plugin extends CollectionPlugin {
 
   async onLoad() {
     globalThis.__ynabPluginSettingsPlugin = this;
+    globalThis.__ynabBusinessPlugin = this;
     await (globalThis.ThymerPluginSettings?.init?.({
       plugin: this,
       pluginId: 'ynab',
@@ -2285,19 +2166,12 @@ class Plugin extends CollectionPlugin {
       data: this.data,
       ui: this.ui,
     }) ?? (console.warn('[YNAB] ThymerPluginSettings runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
-    this._panelStates    = new Map();
     this._eventIds       = [];
-    this._chartInstances = new Map();
-    this._ynNavTimers    = new Map();
 
     // Note: versioned cache keys (v4) mean old-format data auto-expires
     // without needing to manually bust the cache on every load
     this.ui.injectCSS(CSS);
     this.views.register('Dashboard', ctx => this._dashboardView(ctx));
-
-    this._eventIds.push(this.events.on('panel.navigated', ev => this._deferHandlePanel(ev.panel)));
-    this._eventIds.push(this.events.on('panel.focused',   ev => this._handlePanel(ev.panel)));
-    this._eventIds.push(this.events.on('panel.closed',    ev => this._disposePanel(ev.panel?.getId?.())));
 
     this._cmdSync = this.ui.addCommandPaletteCommand({
       label: 'YNAB: Sync Transactions Now', icon: 'ti-refresh',
@@ -2323,22 +2197,20 @@ class Plugin extends CollectionPlugin {
       },
     });
 
-    setTimeout(() => { const p = this.ui.getActivePanel(); if (p) this._handlePanel(p); }, 400);
     // No auto-sync on load — sync is manual only (avoids freezing on large budgets)
   }
 
   onUnload() {
     for (const id of (this._eventIds || [])) { try { this.events.off(id); } catch {} }
     this._eventIds = [];
-    for (const t of (this._ynNavTimers || new Map()).values()) { try { clearTimeout(t); } catch {} }
-    this._ynNavTimers?.clear();
     this._cmdSync?.remove?.();
     this._cmdCfg?.remove?.();
     this._cmdStorage?.remove?.();
-    for (const [pid] of (this._panelStates || new Map())) this._disposePanel(pid);
-    this._panelStates?.clear();
-    for (const [, ch] of (this._chartInstances || new Map())) { try { ch.destroy(); } catch {} }
-    this._chartInstances?.clear();
+    try {
+      if (globalThis.__ynabBusinessPlugin === this) delete globalThis.__ynabBusinessPlugin;
+    } catch (_) {
+      globalThis.__ynabBusinessPlugin = undefined;
+    }
   }
 
   // ── Dashboard view ──────────────────────────────────────────────────────────
@@ -2678,405 +2550,6 @@ class Plugin extends CollectionPlugin {
     const btn = document.createElement('button'); btn.type='button'; btn.className='ynab-btn ynab-btn-primary'; btn.textContent='⚙️ Configure YNAB';
     btn.addEventListener('click', () => this._showConfigDialog());
     w.appendChild(btn); return w;
-  }
-
-  // ── Journal widget ───────────────────────────────────────────────────────────
-
-  _deferHandlePanel(panel) {
-    const panelId = panel?.getId?.();
-    if (!panelId) return;
-    const prev = this._ynNavTimers.get(panelId);
-    if (prev) clearTimeout(prev);
-    this._ynNavTimers.set(panelId, setTimeout(() => {
-      this._ynNavTimers.delete(panelId);
-      this._handlePanel(panel);
-    }, 400));
-  }
-
-  _handlePanel(panel) {
-    const panelId = panel?.getId?.();
-    if (!panelId) return;
-    const navType = panel?.getNavigation?.()?.type || '';
-    if (navType === 'custom' || navType === 'custom_panel') { this._disposePanel(panelId); return; }
-
-    const panelEl = panel?.getElement?.();
-    if (!panelEl) { this._disposePanel(panelId); return; }
-
-    const container = this._findContainer(panelEl);
-    if (!container) {
-      let state = this._panelStates.get(panelId);
-      if (!state) {
-        state = {
-          panelId, panel,
-          recordGuid: null,
-          yyyymmdd: null, year: null, month: null, day: null,
-          rootEl: null, observer: null, loaded: false, loading: false,
-          _pendingPopulateWidget: false,
-          _containerWatcher: null,
-        };
-        this._panelStates.set(panelId, state);
-        state._containerWatcher = new MutationObserver(() => {
-          if (this._findContainer(panelEl)) {
-            try { state._containerWatcher?.disconnect(); } catch {}
-            state._containerWatcher = null;
-            this._handlePanel(panel);
-          }
-        });
-        try {
-          state._containerWatcher.observe(panelEl, { childList: true, subtree: true });
-        } catch (_) {
-          state._containerWatcher = null;
-          this._disposePanel(panelId);
-        }
-      }
-      return;
-    }
-
-    const record = panel?.getActiveRecord?.();
-    if (!record) { this._disposePanel(panelId); return; }
-    const jd = journalDateFromRecord(record);
-    if (!jd) { this._disposePanel(panelId); return; }
-
-    let state = this._panelStates.get(panelId);
-    const wasPlaceholder = state && (state.recordGuid == null || state.yyyymmdd == null);
-    const dateChanged = state != null && state.yyyymmdd != null && state.yyyymmdd !== jd.yyyymmdd;
-    const recordChanged = state != null && state.recordGuid != null && state.recordGuid !== record.guid;
-
-    if (!state) {
-      state = {
-        panelId, panel, recordGuid: record.guid, ...jd,
-        rootEl: null, observer: null, loaded: false, loading: false,
-        _pendingPopulateWidget: false,
-        _containerWatcher: null,
-      };
-      this._panelStates.set(panelId, state);
-    } else {
-      try { state._containerWatcher?.disconnect(); } catch {}
-      state._containerWatcher = null;
-      Object.assign(state, { panel, recordGuid: record.guid, ...jd });
-      if (dateChanged || recordChanged || wasPlaceholder) state.loaded = false;
-    }
-
-    const rebuilt = this._mountWidget(state, container, panelEl);
-    if (rebuilt) state.loading = false;
-
-    const needPopulate = dateChanged || recordChanged || wasPlaceholder || !state.loaded || rebuilt;
-    if (needPopulate) {
-      if (state.loading) state._pendingPopulateWidget = true;
-      else this._populateWidget(state);
-    }
-  }
-
-  _disposePanel(panelId) {
-    if (!panelId) return;
-    const nt = this._ynNavTimers?.get(panelId);
-    if (nt) { try { clearTimeout(nt); } catch {} this._ynNavTimers.delete(panelId); }
-    const s = this._panelStates.get(panelId);
-    if (!s) return;
-    try { s.observer?.disconnect(); } catch {}
-    try { s._containerWatcher?.disconnect(); } catch {}
-    try { clearTimeout(s._navTimer); } catch {}
-    try { s.rootEl?.remove(); }       catch {}
-    const ch = this._chartInstances.get(panelId);
-    if (ch) { try { ch.destroy(); } catch {} this._chartInstances.delete(panelId); }
-    this._panelStates.delete(panelId);
-  }
-
-  /** Returns true if the widget DOM was rebuilt — caller should re-populate and cancel stale async work. */
-  _mountWidget(state, container, panelEl) {
-    const correctlyPlaced = state.rootEl && state.rootEl.isConnected
-      && state.rootEl.parentElement === container
-      && container.firstChild === state.rootEl;
-    if (correctlyPlaced) {
-      if (!state.observer) state.observer = this._createWidgetObserver(state, panelEl);
-      return false;
-    }
-
-    if (state.observer) {
-      try { state.observer.disconnect(); } catch {}
-      state.observer = null;
-    }
-    try { clearTimeout(state._navTimer); } catch {}
-
-    const ch0 = this._chartInstances.get(state.panelId);
-    if (ch0) { try { ch0.destroy(); } catch {} this._chartInstances.delete(state.panelId); }
-
-    for (const el of container.querySelectorAll(':scope > .ynab-widget')) {
-      if (el.dataset?.panelId === state.panelId) { try { el.remove(); } catch {} }
-    }
-
-    state.rootEl = this._buildWidget(state);
-    container.insertBefore(state.rootEl, container.firstChild);
-
-    state.observer = this._createWidgetObserver(state, panelEl);
-    return true;
-  }
-
-  _createWidgetObserver(state, panelEl) {
-    const obs = new MutationObserver(() => {
-      const c = this._findContainer(panelEl);
-      if (state.rootEl && c && state.rootEl.isConnected && state.rootEl.parentElement === c && c.firstChild !== state.rootEl) {
-        c.insertBefore(state.rootEl, c.firstChild);
-      }
-      if (state.rootEl && !state.rootEl.isConnected) {
-        try { clearTimeout(state._navTimer); } catch {}
-        state._navTimer = setTimeout(() => {
-          if (state.panel && state.rootEl && !state.rootEl.isConnected) {
-            this._handlePanel(state.panel);
-          }
-        }, 300);
-      }
-    });
-    obs.observe(panelEl, { childList: true, subtree: true });
-    return obs;
-  }
-
-  /** Prefer the last match — after journal navigation Thymer may leave multiple layers; first match can be stale. */
-  _findContainer(panelEl) {
-    if (!panelEl) return null;
-    for (const sel of ['.page-content', '.editor-wrapper', '.editor-panel', '#editor']) {
-      if (panelEl.matches?.(sel)) return panelEl;
-      const all = panelEl.querySelectorAll?.(sel);
-      if (all && all.length) return all[all.length - 1];
-    }
-    return null;
-  }
-
-  _buildWidget(state) {
-    const collapsed = ls(SK.WIDGET_COLLAPSE) === 'true';
-    const root = document.createElement('div');
-    root.className = 'ynab-widget'; root.dataset.panelId = state.panelId;
-
-    // Header
-    const header = document.createElement('div'); header.className = 'ynab-widget-header';
-    const toggle = document.createElement('button'); toggle.type='button'; toggle.className='ynab-w-toggle'; toggle.innerHTML = collapsed ? '<i class="ti ti-chevron-down"></i>' : '<i class="ti ti-chevron-up"></i>';
-    const title  = document.createElement('span');  title.className='ynab-w-title'; title.innerHTML = '<i class="ti ti-coin"></i> YNAB Income';
-
-    const controls = document.createElement('div'); controls.className='ynab-w-controls'; controls.style.display = collapsed ? 'none' : 'flex';
-    const period = ls(SK.WIDGET_PERIOD) || 'weekly';
-    const ctype  = ls(SK.WIDGET_CHART)  || 'bar';
-    controls.append(
-      this._tgroup([['daily','Daily'],['weekly','Weekly'],['monthly','Monthly']], SK.WIDGET_PERIOD, period, () => this._populateWidget(this._panelStates.get(state.panelId))),
-      this._tgroup([['bar','▊ Bar'],['line','╱ Line']], SK.WIDGET_CHART, ctype, () => this._populateWidget(this._panelStates.get(state.panelId))),
-      this._optGroup(state),
-    );
-
-    toggle.addEventListener('click', () => {
-      const nowCollapsed = body.style.display !== 'none';
-      body.style.display     = nowCollapsed ? 'none' : 'block';
-      controls.style.display = nowCollapsed ? 'none' : 'flex';
-      toggle.innerHTML       = nowCollapsed ? '<i class="ti ti-chevron-down"></i>' : '<i class="ti ti-chevron-up"></i>';
-      lsSet(SK.WIDGET_COLLAPSE, nowCollapsed);
-    });
-    header.append(toggle, title, controls);
-
-    // Body
-    const body = document.createElement('div'); body.className='ynab-widget-body'; body.style.display = collapsed ? 'none' : 'block';
-
-    const filterRow = document.createElement('div'); filterRow.className='ynab-w-filter-row'; filterRow.dataset.role='filters';
-    const statRow   = document.createElement('div'); statRow.className='ynab-stat-row'; statRow.dataset.role='stats';
-    const canvasWrap= document.createElement('div'); canvasWrap.className='ynab-canvas-wrap';
-    const canvas    = document.createElement('canvas'); canvas.dataset.role='chart'; canvas.height=140;
-    canvasWrap.appendChild(canvas);
-    const statusEl  = document.createElement('div'); statusEl.className='ynab-status'; statusEl.dataset.role='status';
-
-    body.append(filterRow, statRow, canvasWrap, statusEl);
-
-    if (!ls(SK.TOKEN)) {
-      const notice = document.createElement('div'); notice.className='ynab-notice';
-      notice.innerHTML='⚙️ <a href="#" class="ynab-cfg-link">Configure YNAB token</a> to enable.';
-      notice.querySelector('.ynab-cfg-link').addEventListener('click', e => { e.preventDefault(); this._showConfigDialog(); });
-      body.appendChild(notice);
-    }
-
-    root.append(header, body);
-    return root;
-  }
-
-  _optGroup(state) {
-    const g = document.createElement('div'); g.className='ynab-tgroup';
-    g.append(
-      this._optBtn('⇄ vs Last', SK.WIDGET_COMPARE, () => this._populateWidget(this._panelStates.get(state.panelId))),
-      this._optBtn('~ Avg',     SK.WIDGET_AVG,     () => this._populateWidget(this._panelStates.get(state.panelId))),
-    );
-    return g;
-  }
-
-  _tgroup(options, storageKey, current, onChange) {
-    const g = document.createElement('div'); g.className='ynab-tgroup';
-    for (const [val, label] of options) {
-      const btn = document.createElement('button'); btn.type='button';
-      btn.className = `ynab-tbtn${current===val?' active':''}`;
-      btn.dataset.val = val; btn.textContent = label;
-      btn.addEventListener('click', () => {
-        lsSet(storageKey, val);
-        g.querySelectorAll('.ynab-tbtn').forEach(b => b.classList.toggle('active', b.dataset.val===val));
-        onChange();
-      });
-      g.appendChild(btn);
-    }
-    return g;
-  }
-
-  _optBtn(label, storageKey, onChange) {
-    const btn = document.createElement('button'); btn.type='button';
-    btn.className = `ynab-tbtn${ls(storageKey)==='true'?' active':''}`;
-    btn.textContent = label;
-    btn.addEventListener('click', () => {
-      const next = ls(storageKey) !== 'true';
-      lsSet(storageKey, next);
-      btn.classList.toggle('active', next);
-      onChange();
-    });
-    return btn;
-  }
-
-  // ── Widget data & chart ─────────────────────────────────────────────────────
-
-  _finishWidgetPopulate(state) {
-    if (!state) return;
-    state.loading = false;
-    if (state._pendingPopulateWidget) {
-      state._pendingPopulateWidget = false;
-      this._populateWidget(state);
-    }
-  }
-
-  async _populateWidget(state) {
-    if (!state) return;
-    if (!ls(SK.TOKEN) || !ls(SK.BUDGET_ID)) {
-      state.loading = false;
-      state._pendingPopulateWidget = false;
-      return;
-    }
-    if (state.loading) {
-      state._pendingPopulateWidget = true;
-      return;
-    }
-    state.loading = true;
-
-    const snapY = state.year, snapM = state.month, snapD = state.day;
-
-    const root      = state.rootEl;
-    const statsEl   = root?.querySelector('[data-role="stats"]');
-    const statusEl  = root?.querySelector('[data-role="status"]');
-    const filterRow = root?.querySelector('[data-role="filters"]');
-
-    if (statusEl) statusEl.textContent = 'Loading…';
-
-    try {
-      await loadChartJs();
-      const txns    = await getTransactions();
-      if (state.year !== snapY || state.month !== snapM || state.day !== snapD) {
-        this._finishWidgetPopulate(state);
-        return;
-      }
-      if (!root?.isConnected) { this._finishWidgetPopulate(state); return; }
-
-      const isIncome = t => isIncomeTransaction(t, txns);
-      const filtered = txns.filter(t => isIncome(t));
-
-      // Render filter row — gear button + live summary
-      if (filterRow) {
-        filterRow.innerHTML = '';
-        const gearBtn = document.createElement('button');
-        gearBtn.className = 'ynab-gear-btn';
-        gearBtn.textContent = '⚙ Filters';
-        gearBtn.addEventListener('click', () => {
-          this._showFilterSettings(txns, () => {
-            this._populateWidget(this._panelStates.get(state.panelId));
-          });
-        });
-        const summary = document.createElement('span');
-        summary.className = 'ynab-filter-summary';
-        const raw = ls(SK.INCL_PAYEES);
-        const inclCount = raw ? JSON.parse(raw).length : txns.filter(t=>t.type==='income').map(t=>t.payee).filter((p,i,a)=>a.indexOf(p)===i).filter(p=>!['transfer','starting'].some(kw=>p.toLowerCase().includes(kw))).length;
-        const exclCount = lsJson(SK.EXCLUDED_GROUPS, DEFAULT_EXCLUDED).length;
-        summary.textContent = `${inclCount} payees · ${exclCount} groups excluded`;
-        filterRow.append(gearBtn, summary);
-      }
-
-      const period  = ls(SK.WIDGET_PERIOD) || 'weekly';
-      const compare = ls(SK.WIDGET_COMPARE) === 'true';
-      const showAvg = ls(SK.WIDGET_AVG)     === 'true';
-      const ctype   = ls(SK.WIDGET_CHART)   || 'bar';
-      const refDate = new Date(state.year, state.month-1, state.day);
-
-      const { labels, cur, prev, curTotal, prevTotal, avg } = bucketData(filtered, refDate, period, compare, showAvg);
-
-      // Stat chips — income only
-      if (statsEl) {
-        statsEl.innerHTML = '';
-        const pl = { daily:'Today', weekly:'This Week', monthly:'This Month' }[period];
-        statsEl.appendChild(this._chip(pl + ' Income', curTotal));
-        if (compare && prevTotal !== null) {
-          const diff = curTotal - prevTotal;
-          statsEl.append(this._chip('vs Last', prevTotal), this._chip('Δ', diff, diff>=0?'pos':'neg'));
-        }
-        if (showAvg && avg !== null) statsEl.appendChild(this._chip('Avg', avg));
-      }
-
-      // Chart
-      const canvasEl = root.querySelector('[data-role="chart"]');
-      if (canvasEl) {
-        const ex = this._chartInstances.get(state.panelId);
-        if (ex) { try { ex.destroy(); } catch {} }
-
-        const greenFill = ctype==='line' ? `rgba(${C.greenRgb}, 0.12)` : `rgba(${C.greenRgb}, 0.75)`;
-
-        const datasets = [{
-          label: 'Income', data: cur,
-          backgroundColor: greenFill, borderColor: C.green, borderWidth: ctype==='bar'?1:2,
-          tension: 0.35, fill: ctype==='line',
-          pointRadius: ctype==='line'?2:0, pointBackgroundColor: C.green,
-          type: ctype,
-        }];
-        if (compare && prev) datasets.push({
-          label:'Last Period', data:prev, type:'line',
-          backgroundColor:'transparent', borderColor: C.prevLine, borderWidth:1,
-          borderDash:[4,4], tension:0.35, fill:false, pointRadius:0,
-        });
-        if (showAvg && avg !== null) datasets.push({
-          label:'Avg', data:Array(labels.length).fill(avg), type:'line',
-          borderColor: C.avgLine, borderWidth:1, borderDash:[5,3], pointRadius:0, fill:false,
-        });
-
-        const chart = new window.Chart(canvasEl, {
-          type: ctype,
-          data: { labels, datasets },
-          options: {
-            responsive:true, maintainAspectRatio:false, animation:{duration:220},
-            plugins:{
-              legend:{ display: compare||showAvg, labels:{color:C.axisText,font:{size:10},boxWidth:18} },
-              tooltip:{ callbacks:{label:c=>`${c.dataset.label}: ${fmt(c.parsed.y)}`} },
-            },
-            scales:{
-              x:{ticks:{color:C.axisText,font:{size:10}},grid:{color:'rgba(255,255,255,0.04)'}},
-              y:{ticks:{color:C.axisText,font:{size:10},callback:v=>`$${v}`},grid:{color:'rgba(255,255,255,0.04)'},beginAtZero:true},
-            },
-          },
-        });
-        this._chartInstances.set(state.panelId, chart);
-      }
-
-      const ts = ls(SK.CACHE_TS);
-      if (statusEl) statusEl.textContent = ts ? `Synced ${new Date(parseInt(ts,10)).toLocaleTimeString()}` : '';
-
-    } catch (e) {
-      console.error('[YNAB widget]', e);
-      if (statusEl && state.year === snapY && state.month === snapM && state.day === snapD) {
-        statusEl.textContent = `Error: ${e.message}`;
-      }
-    }
-
-    state.loaded = true;
-    this._finishWidgetPopulate(state);
-  }
-
-  _chip(label, amount, mod='') {
-    const c = document.createElement('div'); c.className=`ynab-stat-chip${mod?' '+mod:''}`;
-    c.innerHTML=`<span class="ynab-sl">${label}</span><span class="ynab-sv">${fmt(amount)}</span>`;
-    return c;
   }
 
   // ── Sync ────────────────────────────────────────────────────────────────────
