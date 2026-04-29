@@ -499,6 +499,7 @@
     const coll = await findColl(data);
     if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') return;
     await upgradePluginSettingsSchema(data, coll);
+    let slugRegisterSavedOk = false;
     try {
       const base = coll.getConfiguration() || {};
       const fields = Array.isArray(base.fields) ? [...base.fields] : [];
@@ -546,11 +547,12 @@
         fields[idx] = next;
         const ok = await coll.saveConfiguration(withUnlockedManaged({ ...base, fields }));
         if (ok === false) console.warn('[ThymerPluginSettings] registerPluginSlug: saveConfiguration returned false');
+        else slugRegisterSavedOk = true;
       }
     } catch (e) {
       console.error('[ThymerPluginSettings] registerPluginSlug', e);
     }
-    await rewritePluginChoiceCells(coll);
+    if (slugRegisterSavedOk) await rewritePluginChoiceCells(coll);
   }
 
   /**
@@ -627,7 +629,7 @@
           } catch (_) {}
         }
       }
-      await rewritePluginChoiceCells(coll);
+      if (changed) await rewritePluginChoiceCells(coll);
     } catch (e) {
       console.error('[ThymerPluginSettings] upgrade schema', e);
     }
@@ -1072,10 +1074,10 @@
     return named || cands[0];
   }
 
-  async function findColl(data) {
+  function pickCollFromAll(all) {
     try {
-      const pick = (all) => {
-        const list = Array.isArray(all) ? all : [];
+      const pick = (allIn) => {
+        const list = Array.isArray(allIn) ? allIn : [];
         return (
           list.find((c) => collectionDisplayName(c) === COL_NAME) ||
           list.find((c) => collectionDisplayName(c) === COL_NAME_LEGACY) ||
@@ -1084,8 +1086,27 @@
           null
         );
       };
-      const all = await data.getAllCollections();
       return pick(all) || pickPathBCollectionHeuristic(all) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function hasPluginBackendInAll(all) {
+    if (!Array.isArray(all) || all.length === 0) return false;
+    for (const c of all) {
+      const nm = collectionDisplayName(c);
+      if (nm === COL_NAME || nm === COL_NAME_LEGACY) return true;
+      const cfg = collectionBackendConfiguredTitle(c);
+      if (cfg === COL_NAME || cfg === COL_NAME_LEGACY) return true;
+    }
+    return !!pickPathBCollectionHeuristic(all);
+  }
+
+  async function findColl(data) {
+    try {
+      const all = await data.getAllCollections();
+      return pickCollFromAll(all);
     } catch (_) {
       return null;
     }
@@ -1099,14 +1120,7 @@
     } catch (_) {
       return false;
     }
-    if (!Array.isArray(all) || all.length === 0) return false;
-    for (const c of all) {
-      const nm = collectionDisplayName(c);
-      if (nm === COL_NAME || nm === COL_NAME_LEGACY) return true;
-      const cfg = collectionBackendConfiguredTitle(c);
-      if (cfg === COL_NAME || cfg === COL_NAME_LEGACY) return true;
-    }
-    return !!pickPathBCollectionHeuristic(all);
+    return hasPluginBackendInAll(all);
   }
 
   const PB_LOCK_NAME = 'thymer-ext-plugin-backend-ensure-v1';
@@ -1203,17 +1217,52 @@
     try {
       let existing = null;
       for (let attempt = 0; attempt < 4; attempt++) {
+        let allAttempt;
+        try {
+          allAttempt = await data.getAllCollections();
+        } catch (_) {
+          allAttempt = null;
+        }
+        if (allAttempt != null) {
+          existing = pickCollFromAll(allAttempt);
+          if (existing) return;
+          if (hasPluginBackendInAll(allAttempt)) return;
+        } else {
+          existing = await findColl(data);
+          if (existing) return;
+          if (await hasPluginBackendOnWorkspace(data)) return;
+        }
+        if (attempt < 3) await new Promise((r) => setTimeout(r, 50 + attempt * 50));
+      }
+      let allPost;
+      try {
+        allPost = await data.getAllCollections();
+      } catch (_) {
+        allPost = null;
+      }
+      if (allPost != null) {
+        existing = pickCollFromAll(allPost);
+        if (existing) return;
+        if (hasPluginBackendInAll(allPost)) return;
+      } else {
         existing = await findColl(data);
         if (existing) return;
         if (await hasPluginBackendOnWorkspace(data)) return;
-        if (attempt < 3) await new Promise((r) => setTimeout(r, 50 + attempt * 50));
       }
-      existing = await findColl(data);
-      if (existing) return;
-      if (await hasPluginBackendOnWorkspace(data)) return;
       await new Promise((r) => setTimeout(r, 120));
-      if (await findColl(data)) return;
-      if (await hasPluginBackendOnWorkspace(data)) return;
+      let allAfterWait;
+      try {
+        allAfterWait = await data.getAllCollections();
+      } catch (_) {
+        allAfterWait = null;
+      }
+      if (allAfterWait != null) {
+        if (pickCollFromAll(allAfterWait)) return;
+        if (hasPluginBackendInAll(allAfterWait)) return;
+      } else {
+        if (await findColl(data)) return;
+        if (await hasPluginBackendOnWorkspace(data)) return;
+      }
       let preCreateLen = 0;
       try {
         if (data && data.getAllCollections) {
@@ -1230,8 +1279,19 @@
           }
         }
         if (preCreateLen > 0) {
-          if (await findColl(data)) return;
-          if (await hasPluginBackendOnWorkspace(data)) return;
+          let allPre;
+          try {
+            allPre = await data.getAllCollections();
+          } catch (_) {
+            allPre = null;
+          }
+          if (allPre != null) {
+            if (pickCollFromAll(allPre)) return;
+            if (hasPluginBackendInAll(allPre)) return;
+          } else {
+            if (await findColl(data)) return;
+            if (await hasPluginBackendOnWorkspace(data)) return;
+          }
         }
         if (isSuspiciousEmptyAfterRecentNonEmptyList(preCreateLen) && preCreateLen === 0) {
           if (DEBUG_COLLECTIONS) {
@@ -1251,15 +1311,37 @@
       const lease = await acquirePluginBackendCreationLease(14000, data);
       if (lease.denied) return;
       try {
-        if (await findColl(data)) return;
-        if (await hasPluginBackendOnWorkspace(data)) return;
+        let allLease;
+        try {
+          allLease = await data.getAllCollections();
+        } catch (_) {
+          allLease = null;
+        }
+        if (allLease != null) {
+          if (pickCollFromAll(allLease)) return;
+          if (hasPluginBackendInAll(allLease)) return;
+        } else {
+          if (await findColl(data)) return;
+          if (await hasPluginBackendOnWorkspace(data)) return;
+        }
         const recentAttemptAge = getRecentPluginBackendCreateAttemptAgeMs(data);
         if (recentAttemptAge != null && recentAttemptAge >= 0 && recentAttemptAge < 120000) {
           // Another plugin iframe attempted creation very recently. Avoid burst duplicate creates.
           for (let i = 0; i < 10; i++) {
             await new Promise((r) => setTimeout(r, 130 + i * 70));
-            if (await findColl(data)) return;
-            if (await hasPluginBackendOnWorkspace(data)) return;
+            let allCont;
+            try {
+              allCont = await data.getAllCollections();
+            } catch (_) {
+              allCont = null;
+            }
+            if (allCont != null) {
+              if (pickCollFromAll(allCont)) return;
+              if (hasPluginBackendInAll(allCont)) return;
+            } else {
+              if (await findColl(data)) return;
+              if (await hasPluginBackendOnWorkspace(data)) return;
+            }
           }
           return;
         }
@@ -1268,8 +1350,19 @@
           // Another plugin/runtime likely just created it; let collection list/indexing settle first.
           for (let i = 0; i < 8; i++) {
             await new Promise((r) => setTimeout(r, 120 + i * 60));
-            if (await findColl(data)) return;
-            if (await hasPluginBackendOnWorkspace(data)) return;
+            let allSettle;
+            try {
+              allSettle = await data.getAllCollections();
+            } catch (_) {
+              allSettle = null;
+            }
+            if (allSettle != null) {
+              if (pickCollFromAll(allSettle)) return;
+              if (hasPluginBackendInAll(allSettle)) return;
+            } else {
+              if (await findColl(data)) return;
+              if (await hasPluginBackendOnWorkspace(data)) return;
+            }
           }
         }
         noteRecentPluginBackendCreateAttempt(data);
@@ -2534,6 +2627,25 @@ const CSS = `
 
 class Plugin extends CollectionPlugin {
 
+  /** One `getAllCollections` per workspace after the YNAB collection is found (cleared on unload). */
+  _ynabCollsKey = null;
+  _ynabCollsResolved = false;
+  _ynabTxnColl = null;
+
+  async _ensureYnabTxnCollection() {
+    let key = '';
+    try {
+      key = String(this.data.getActiveUsers?.()?.[0]?.workspaceGuid || '');
+    } catch (_) {}
+    if (this._ynabCollsKey === key && this._ynabCollsResolved && this._ynabTxnColl) return this._ynabTxnColl;
+    const collections = await this.data.getAllCollections();
+    const coll = collections.find((c) => c.getName() === YNAB_COLLECTION_NAME) || null;
+    this._ynabTxnColl = coll;
+    this._ynabCollsKey = key;
+    this._ynabCollsResolved = !!coll;
+    return coll;
+  }
+
   async onLoad() {
     globalThis.__ynabPluginSettingsPlugin = this;
     await (globalThis.ThymerPluginSettings?.init?.({
@@ -2588,6 +2700,9 @@ class Plugin extends CollectionPlugin {
   }
 
   onUnload() {
+    this._ynabCollsKey = null;
+    this._ynabCollsResolved = false;
+    this._ynabTxnColl = null;
     for (const id of (this._eventIds || [])) { try { this.events.off(id); } catch {} }
     this._eventIds = [];
     for (const t of (this._ynNavTimers || new Map()).values()) { try { clearTimeout(t); } catch {} }
