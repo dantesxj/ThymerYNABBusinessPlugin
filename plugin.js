@@ -2648,6 +2648,14 @@ class Plugin extends CollectionPlugin {
 
   async onLoad() {
     globalThis.__ynabPluginSettingsPlugin = this;
+    /**
+     * Journal income widget on daily pages. Default off (Journal Header Suite embeds YNAB).
+     * Set `custom.mount_journal_income_widget` to true in this collection’s config to mount the standalone widget.
+     */
+    const c = this.getConfiguration?.()?.custom;
+    const hasMountKey = c && Object.prototype.hasOwnProperty.call(c, 'mount_journal_income_widget');
+    this._mountJournalIncomeWidget = hasMountKey ? c.mount_journal_income_widget !== false : false;
+    globalThis.__ynabBusinessPlugin = this;
     await (globalThis.ThymerPluginSettings?.init?.({
       plugin: this,
       pluginId: 'ynab',
@@ -2667,9 +2675,11 @@ class Plugin extends CollectionPlugin {
     this.ui.injectCSS(CSS);
     this.views.register('Dashboard', ctx => this._dashboardView(ctx));
 
-    this._eventIds.push(this.events.on('panel.navigated', ev => this._deferHandlePanel(ev.panel)));
-    this._eventIds.push(this.events.on('panel.focused',   ev => this._handlePanel(ev.panel)));
-    this._eventIds.push(this.events.on('panel.closed',    ev => this._disposePanel(ev.panel?.getId?.())));
+    if (this._mountJournalIncomeWidget) {
+      this._eventIds.push(this.events.on('panel.navigated', ev => this._deferHandlePanel(ev.panel)));
+      this._eventIds.push(this.events.on('panel.focused',   ev => this._handlePanel(ev.panel)));
+      this._eventIds.push(this.events.on('panel.closed',    ev => this._disposePanel(ev.panel?.getId?.())));
+    }
 
     this._cmdSync = this.ui.addCommandPaletteCommand({
       label: 'YNAB: Sync Transactions Now', icon: 'ti-refresh',
@@ -2695,11 +2705,19 @@ class Plugin extends CollectionPlugin {
       },
     });
 
-    setTimeout(() => { const p = this.ui.getActivePanel(); if (p) this._handlePanel(p); }, 400);
+    if (this._mountJournalIncomeWidget) {
+      try {
+        const p0 = this.ui.getActivePanel();
+        if (p0) requestAnimationFrame(() => this._handlePanel(p0));
+      } catch (_) {}
+      setTimeout(() => { const p = this.ui.getActivePanel(); if (p) this._handlePanel(p); }, 120);
+    }
     // No auto-sync on load — sync is manual only (avoids freezing on large budgets)
   }
 
   onUnload() {
+    if (globalThis.__ynabBusinessPlugin === this) globalThis.__ynabBusinessPlugin = undefined;
+    if (globalThis.__ynabPluginSettingsPlugin === this) globalThis.__ynabPluginSettingsPlugin = undefined;
     this._ynabCollsKey = null;
     this._ynabCollsResolved = false;
     this._ynabTxnColl = null;
@@ -2735,15 +2753,20 @@ class Plugin extends CollectionPlugin {
   }
 
   async _renderDash(container) {
-    container.innerHTML = '<div class="ynab-dash-loading">Loading…</div>';
+    container.innerHTML = '<div class="ynab-dash-loading">Preparing…</div>';
     if (!ls(SK.TOKEN) || !ls(SK.BUDGET_ID)) {
       container.innerHTML = '';
       container.appendChild(this._cfgPrompt());
       return;
     }
     try {
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      const loadEl = container.querySelector('.ynab-dash-loading');
+      if (loadEl) loadEl.textContent = 'Loading chart library…';
       await loadChartJs();
+      if (loadEl) loadEl.textContent = 'Loading transactions…';
       const txns = await getTransactions();
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
       container.innerHTML = '';
       container.appendChild(this._buildDash(txns));
     } catch (e) {
@@ -3065,7 +3088,7 @@ class Plugin extends CollectionPlugin {
     this._ynNavTimers.set(panelId, setTimeout(() => {
       this._ynNavTimers.delete(panelId);
       this._handlePanel(panel);
-    }, 400));
+    }, 120));
   }
 
   _handlePanel(panel) {
@@ -3237,11 +3260,16 @@ class Plugin extends CollectionPlugin {
     );
 
     toggle.addEventListener('click', () => {
-      const nowCollapsed = body.style.display !== 'none';
+      const wasCollapsed = body.style.display === 'none';
+      const nowCollapsed = !wasCollapsed;
       body.style.display     = nowCollapsed ? 'none' : 'block';
       controls.style.display = nowCollapsed ? 'none' : 'flex';
       toggle.innerHTML       = nowCollapsed ? '<i class="ti ti-chevron-down"></i>' : '<i class="ti ti-chevron-up"></i>';
       lsSet(SK.WIDGET_COLLAPSE, nowCollapsed);
+      if (wasCollapsed) {
+        const st = this._panelStates.get(state.panelId);
+        if (st) void this._populateWidget(st);
+      }
     });
     header.append(toggle, title, controls);
 
@@ -3336,12 +3364,24 @@ class Plugin extends CollectionPlugin {
     const statsEl   = root?.querySelector('[data-role="stats"]');
     const statusEl  = root?.querySelector('[data-role="status"]');
     const filterRow = root?.querySelector('[data-role="filters"]');
+    const widgetBody = root?.querySelector('.ynab-widget-body');
 
-    if (statusEl) statusEl.textContent = 'Loading…';
+    if (widgetBody && widgetBody.style.display === 'none') {
+      state.loading = false;
+      if (statusEl) statusEl.textContent = '';
+      this._finishWidgetPopulate(state);
+      return;
+    }
+
+    if (statusEl) statusEl.textContent = 'Loading chart…';
 
     try {
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      if (statusEl) statusEl.textContent = 'Loading chart library…';
       await loadChartJs();
+      if (statusEl) statusEl.textContent = 'Loading transactions…';
       const txns    = await getTransactions();
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
       if (state.year !== snapY || state.month !== snapM || state.day !== snapD) {
         this._finishWidgetPopulate(state);
         return;

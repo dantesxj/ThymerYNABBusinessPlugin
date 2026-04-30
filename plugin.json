@@ -205,7 +205,9 @@
 		"views": false,
 		"sidebar": false
 	},
-	"custom": {},
+	"custom": {
+		"mount_journal_income_widget": false
+	},
 	"views": [
 		{
 			"id": "VYNAB000",
