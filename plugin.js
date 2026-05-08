@@ -4,7 +4,12 @@
 // icon: ti-coin
 // ==/Plugin==
 
-
+/**
+ * Diagnostic instrumentation calls below (`globalThis.__thymerDiag?.record?.(...)` and
+ * the panic gate) are no-ops unless the standalone **Thymer Diagnostics** plugin is
+ * loaded. That plugin owns the runtime, command palette commands, and the live diag
+ * dashboard — install/enable it when something feels wrong, disable it when not.
+ */
 
 // @generated BEGIN thymer-plugin-settings (source: plugins/public repo/plugin-settings/ThymerPluginSettingsRuntime.js — run: npm run embed-plugin-settings)
 /**
@@ -2763,12 +2768,69 @@ const CSS = `
 // PLUGIN
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * True if `document.activeElement` is a typeable element inside `container` —
+ * input / textarea / select / contenteditable. We use this to *defer* dashboard
+ * re-renders while the user is mid-type so we don’t blow away their cursor and
+ * focus on every plugin-backend `onRefresh`. Buttons / checkboxes / radios are
+ * intentionally skipped so a click toggle still re-renders immediately.
+ */
+function _ynabIsUserEditingInside(container) {
+  if (!container) return false;
+  const a = typeof document !== 'undefined' ? document.activeElement : null;
+  if (!a || a === document.body) return false;
+  if (!container.contains(a)) return false;
+  const tag = a.tagName;
+  if (tag === 'INPUT') {
+    const type = String(a.type || '').toLowerCase();
+    if (
+      type === 'checkbox' ||
+      type === 'radio' ||
+      type === 'button' ||
+      type === 'submit' ||
+      type === 'reset' ||
+      type === 'file'
+    ) {
+      return false;
+    }
+    return true;
+  }
+  return tag === 'TEXTAREA' || tag === 'SELECT' || a.isContentEditable === true;
+}
+
+/**
+ * Wrap a view object so missing `on*` lifecycle hooks return a no-op instead of throwing.
+ * Without this, Thymer core's `view.onKeyboardNavigation()` / `onFocus()` / `onBlur()` /
+ * `onPanelResize()` calls throw `TypeError` on every keystroke and mouse event when those
+ * hooks aren't implemented, which fires `window.onerror` 30+ times per second and stalls
+ * the main thread (each error → sync localStorage write in the diag runtime).
+ */
+function _ynabThymerNoop() {}
+function _ynabStubViewMethods(view) {
+  if (!view || typeof view !== 'object') return view;
+  return new Proxy(view, {
+    get(target, prop) {
+      if (prop in target) return target[prop];
+      if (typeof prop === 'string' && /^on[A-Z]/.test(prop)) return _ynabThymerNoop;
+      return undefined;
+    },
+  });
+}
+
 class Plugin extends CollectionPlugin {
 
   /** One `getAllCollections` per workspace after the YNAB collection is found (cleared on unload). */
   _ynabCollsKey = null;
   _ynabCollsResolved = false;
   _ynabTxnColl = null;
+  /** `injectCSS` must run once — repeated calls (plugin reload) can thrash layout. */
+  _ynabUiCssInstalled = false;
+  /**
+   * Plugin Backend writes (e.g. Bilt Value Tracker `scheduleFlush`) cause Thymer to fire
+   * `onRefresh` on every open plugin panel. Without debounce, this re-runs the full YNAB
+   * dashboard (Chart.js + transaction load) in a tight loop → flicker + app freeze.
+   */
+  _ynabDashRenderGen = 0;
 
   async _ensureYnabTxnCollection() {
     let key = '';
@@ -2785,6 +2847,12 @@ class Plugin extends CollectionPlugin {
   }
 
   async onLoad() {
+    const diag = globalThis.__thymerDiag;
+    diag?.record?.('YNAB_ONLOAD_START');
+    if (diag?.isPanic?.()) {
+      diag.record('YNAB_ONLOAD_PANIC_SKIP');
+      return;
+    }
     globalThis.__ynabPluginSettingsPlugin = this;
     /**
      * Journal income widget on daily pages. Default off (Journal Header Suite embeds YNAB).
@@ -2810,7 +2878,14 @@ class Plugin extends CollectionPlugin {
 
     // Note: versioned cache keys (v4) mean old-format data auto-expires
     // without needing to manually bust the cache on every load
-    this.ui.injectCSS(CSS);
+    if (!this._ynabUiCssInstalled) {
+      try {
+        this.ui.injectCSS(CSS);
+        this._ynabUiCssInstalled = true;
+      } catch (_) {
+        this._ynabUiCssInstalled = false;
+      }
+    }
     this.views.register('Dashboard', ctx => this._dashboardView(ctx));
 
     this._eventIds.push(this.events.on('panel.navigated', ev => this._deferHandlePanel(ev.panel)));
@@ -2880,6 +2955,7 @@ class Plugin extends CollectionPlugin {
   onUnload() {
     if (globalThis.__ynabBusinessPlugin === this) globalThis.__ynabBusinessPlugin = undefined;
     if (globalThis.__ynabPluginSettingsPlugin === this) globalThis.__ynabPluginSettingsPlugin = undefined;
+    this._ynabUiCssInstalled = false;
     this._ynabCollsKey = null;
     this._ynabCollsResolved = false;
     this._ynabTxnColl = null;
@@ -2895,6 +2971,7 @@ class Plugin extends CollectionPlugin {
     this._cmdJournalWidgetClear?.remove?.();
     for (const [pid] of (this._panelStates || new Map())) this._disposePanel(pid);
     this._panelStates?.clear();
+    this._dashRefreshers?.clear();
     for (const [, ch] of (this._chartInstances || new Map())) { try { ch.destroy(); } catch {} }
     this._chartInstances?.clear();
   }
@@ -2903,39 +2980,154 @@ class Plugin extends CollectionPlugin {
 
   _dashboardView(ctx) {
     let el, container;
-    return {
+    let refreshTimer = null;
+    const dashKey = `ynab-dash-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    /**
+     * If the user is mid-type (date range, filter input, search box, …) we don’t want
+     * to wipe out their focus by re-rendering. Re-arm the timer for another 1200ms and
+     * try again later. Otherwise the previous typing fix becomes “focus thrashing.”
+     */
+    const tick = () => {
+      refreshTimer = null;
+      if (!container) return;
+      if (_ynabIsUserEditingInside(container)) {
+        globalThis.__thymerDiag?.record?.('YNAB_PANEL_REFRESH_DEFERRED_TYPING');
+        refreshTimer = setTimeout(tick, 1200);
+        return;
+      }
+      void this._renderDash(container);
+    };
+    /**
+     * `debouncedRefresh` is invoked exclusively by our own code now (see the
+     * `onRefresh` block comment below). We register it in `_dashRefreshers` so
+     * sync (`_syncAll`) and any future "data changed, please repaint" call sites
+     * can iterate the map and fire each open dashboard. Coalesces a tight burst
+     * of internal triggers into a single render.
+     */
+    const debouncedRefresh = () => {
+      globalThis.__thymerDiag?.record?.('YNAB_PANEL_REFRESH_FIRED');
+      if (refreshTimer != null) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(tick, 400);
+    };
+    return _ynabStubViewMethods({
       onLoad: () => {
+        globalThis.__thymerDiag?.record?.('YNAB_PANEL_OPEN');
         ctx.makeWideLayout?.();
         el = ctx.getElement();
         el.style.overflow = 'auto';
         container = document.createElement('div');
         el.appendChild(container);
-        this._renderDash(container);
+        if (!this._dashRefreshers) this._dashRefreshers = new Map();
+        this._dashRefreshers.set(dashKey, debouncedRefresh);
+        void this._renderDash(container);
       },
-      onRefresh: () => { if (container) this._renderDash(container); },
-      onDestroy: () => { container = null; el = null; },
-    };
+      /**
+       * **Manual refresh model** — Thymer fires `onRefresh` on every open panel for
+       * every collection write, including from sibling plugins (e.g. Bilt writes
+       * to Plugin Backend → all YNAB dashboards repaint). For a panel that parses
+       * 1500+ cached transactions and rebuilds dozens of charts, that cascade was
+       * causing visible jank and dashboard flicker.
+       *
+       * The dashboard now repaints only when:
+       *  - The panel is opened (initial render)
+       *  - The user clicks the in-dashboard "Refresh" button
+       *  - `_syncAll` finishes (we iterate `_dashRefreshers` after the sync writes)
+       *  - Any future internal write site explicitly fires its dashKey's refresher
+       *
+       * If you ever want the old auto-repaint-on-every-write behavior back, swap the
+       * body below for `debouncedRefresh()`. Recorded as `YNAB_PANEL_REFRESH_IGNORED`
+       * so the deep-instrumentation diagnostic can confirm we're skipping these.
+       */
+      onRefresh: () => {
+        globalThis.__thymerDiag?.record?.('YNAB_PANEL_REFRESH_IGNORED');
+      },
+      onDestroy: () => {
+        globalThis.__thymerDiag?.record?.('YNAB_PANEL_CLOSE');
+        if (refreshTimer != null) {
+          try {
+            clearTimeout(refreshTimer);
+          } catch (_) {}
+          refreshTimer = null;
+        }
+        try {
+          this._dashRefreshers?.delete(dashKey);
+        } catch (_) {}
+        container = null;
+        el = null;
+      },
+    });
   }
 
+  /**
+   * Atomic, non-destructive dashboard render.
+   *  - First render shows a “Preparing…” spinner so the user knows something’s happening.
+   *  - **Subsequent renders keep the existing DOM visible** while the new tree is built,
+   *    then swap with `replaceChildren()` in one shot. No more wiping date inputs out
+   *    from under your fingers, no more flicker on every Plugin Backend write.
+   *  - `gen` is a generation counter — if a newer render starts before this one
+   *    finishes its async work, we abort the older one before any DOM swap.
+   */
   async _renderDash(container) {
-    container.innerHTML = '<div class="ynab-dash-loading">Preparing…</div>';
+    const gen = ++this._ynabDashRenderGen;
+    const diag = globalThis.__thymerDiag;
+    const diagStart = diag ? Date.now() : 0;
+    diag?.record?.('YNAB_RENDER_START', { gen });
+    /** Only the very first render gets the loading placeholder. */
+    const isFirstRender = container.childElementCount === 0;
+    if (isFirstRender) {
+      const placeholder = document.createElement('div');
+      placeholder.className = 'ynab-dash-loading';
+      placeholder.textContent = 'Preparing…';
+      container.replaceChildren(placeholder);
+    }
     if (!ls(SK.TOKEN) || !ls(SK.BUDGET_ID)) {
-      container.innerHTML = '';
-      container.appendChild(this._cfgPrompt());
+      if (gen !== this._ynabDashRenderGen) return;
+      container.replaceChildren(this._cfgPrompt());
       return;
     }
     try {
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      const loadEl = container.querySelector('.ynab-dash-loading');
-      if (loadEl) loadEl.textContent = 'Loading chart library…';
+      if (gen !== this._ynabDashRenderGen) return;
+      if (isFirstRender) {
+        const loadEl = container.querySelector('.ynab-dash-loading');
+        if (loadEl) loadEl.textContent = 'Loading chart library…';
+      }
       await loadChartJs();
-      if (loadEl) loadEl.textContent = 'Loading transactions…';
+      if (gen !== this._ynabDashRenderGen) return;
+      if (isFirstRender) {
+        const loadEl = container.querySelector('.ynab-dash-loading');
+        if (loadEl) loadEl.textContent = 'Loading transactions…';
+      }
       const txns = await getTransactions();
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      container.innerHTML = '';
-      container.appendChild(this._buildDash(txns));
+      if (gen !== this._ynabDashRenderGen) return;
+      /**
+       * One more “user editing?” check right before the swap — `_renderDash` may
+       * have been kicked off before the user grabbed an input. If they’re typing
+       * now, abort the swap; the panel’s debounce loop will retry shortly.
+       */
+      if (_ynabIsUserEditingInside(container)) {
+        diag?.record?.('YNAB_RENDER_ABORT_TYPING', { gen });
+        return;
+      }
+      const newDash = this._buildDash(txns);
+      if (gen !== this._ynabDashRenderGen) return;
+      container.replaceChildren(newDash);
+      diag?.record?.('YNAB_RENDER_END', {
+        gen,
+        ms: diag ? Date.now() - diagStart : 0,
+        txns: Array.isArray(txns) ? txns.length : 0,
+      });
     } catch (e) {
-      container.innerHTML = `<div class="ynab-dash-error">Error: ${e.message}</div>`;
+      diag?.record?.('YNAB_RENDER_ERROR', {
+        gen,
+        ms: diag ? Date.now() - diagStart : 0,
+        err: String(e?.message || e).slice(0, 200),
+      });
+      if (gen !== this._ynabDashRenderGen) return;
+      const errEl = document.createElement('div');
+      errEl.className = 'ynab-dash-error';
+      errEl.textContent = `Error: ${e.message}`;
+      container.replaceChildren(errEl);
     }
   }
 
@@ -2990,9 +3182,17 @@ class Plugin extends CollectionPlugin {
     const actionRow=document.createElement('div'); actionRow.className='ynab-action-row';
     const syncBtn=document.createElement('button'); syncBtn.type='button'; syncBtn.className='ynab-btn ynab-btn-primary'; syncBtn.textContent='↻ Sync Now';
     syncBtn.addEventListener('click', ()=>this._syncAll(true));
+    /**
+     * Manual repaint button. Thymer's `onRefresh` is now a no-op (see `_dashboardView`)
+     * so this is the user-facing way to recompute the dashboard from cached transactions
+     * after, say, changing settings outside this panel or just wanting a fresh paint.
+     */
+    const refreshBtn=document.createElement('button'); refreshBtn.type='button'; refreshBtn.className='ynab-btn'; refreshBtn.textContent='⟳ Refresh';
+    refreshBtn.title = 'Recompute the dashboard from cached transactions and current settings';
+    refreshBtn.addEventListener('click', ()=>this._fireDashRefreshers());
     const exportBtn=document.createElement('button'); exportBtn.type='button'; exportBtn.className='ynab-btn'; exportBtn.textContent='⬇ Export CSV';
     exportBtn.addEventListener('click', ()=>this._exportCSV(allTxns, fromInput.value, toInput.value, lsJson(SK.EXCLUDED_GROUPS, DEFAULT_EXCLUDED)));
-    actionRow.append(syncBtn, exportBtn);
+    actionRow.append(syncBtn, refreshBtn, exportBtn);
     wrap.appendChild(actionRow);
 
     // ── Filter row — gear button opens settings modal ──
@@ -3737,6 +3937,7 @@ class Plugin extends CollectionPlugin {
 
       if (toCreate.length === 0) {
         this.ui.addToaster({title:'YNAB Sync',message:`Up to date · ${updated} memo updates`,dismissible:true,autoDestroyTime:4000});
+        this._fireDashRefreshers();
         return;
       }
 
@@ -3802,9 +4003,24 @@ class Plugin extends CollectionPlugin {
         message: `${created} new · ${updated} updated`,
         dismissible: true, autoDestroyTime: 5000,
       });
+      this._fireDashRefreshers();
     } catch (e) {
       console.error('[YNAB sync]', e);
       this.ui.addToaster({title:'YNAB Sync Error',message:e.message,dismissible:true,autoDestroyTime:6000});
+    }
+  }
+
+  /**
+   * Trigger the per-panel debounced refresh for every open YNAB dashboard. Used by
+   * `_syncAll` and any other internal write site that needs to invalidate cached
+   * render output. Safe to call when no dashboards are open (the map is empty).
+   */
+  _fireDashRefreshers() {
+    if (!this._dashRefreshers || this._dashRefreshers.size === 0) return;
+    for (const fn of this._dashRefreshers.values()) {
+      try {
+        fn();
+      } catch (_) {}
     }
   }
 
