@@ -65,6 +65,237 @@
   const DEBUG_PATHB_ID =
     'pb-' + (Date.now() & 0xffffffff).toString(16) + '-' + Math.random().toString(36).slice(2, 7);
 
+  /** In-flight dedupe: parallel plugin `init()` calls share one `getAllCollections()` snapshot. */
+  const DATA_GET_ALL_P = '__thymerExtGetAllCollectionsInflight';
+
+  function preferDeferredHeavyWork() {
+    try {
+      if (typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches) return true;
+    } catch (_) {}
+    try {
+      return Number(navigator?.maxTouchPoints) > 0;
+    } catch (_) {}
+    return false;
+  }
+
+  const MOBILE_GRACE_UNTIL_KEY = '__thymerExtMobileGraceUntil';
+  const MOBILE_HIDDEN_AT_KEY = '__thymerExtMobileHiddenAt';
+  const MOBILE_INTERACT_THROTTLE_AT_KEY = '__thymerExtMobileInteractThrottleAt';
+  /** Pause footer scans / Path B until host sidebar is up — keep short so navigation is not blocked for ~2 min. */
+  const MOBILE_GRACE_MS = 45000;
+  const MOBILE_RESUME_GRACE_MS = 35000;
+  const MOBILE_RESUME_AWAY_MS = 15000;
+  /** Interaction only pauses the heavy-work queue briefly — do not extend MOBILE_GRACE (that delayed page change until ~2 min). */
+  const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 10000;
+  const MOBILE_INTERACTION_THROTTLE_MS = 2500;
+  const HEAVY_QUEUE_PAUSED_UNTIL_KEY = '__thymerExtHeavyQueuePausedUntil';
+
+  // Heavy work scheduler: many plugins "wake up" together after mobile grace ends.
+  // Running them concurrently causes long-task storms that block navigation.
+  const HEAVY_Q_KEY = '__thymerExtHeavyWorkQueue';
+  const HEAVY_BUSY_KEY = '__thymerExtHeavyWorkBusy';
+
+  function ensureMobileLoadGraceStarted(extraMs) {
+    if (!preferDeferredHeavyWork()) return;
+    const until = Date.now() + (extraMs > 0 ? extraMs : MOBILE_GRACE_MS);
+    try {
+      if (!g[MOBILE_GRACE_UNTIL_KEY] || g[MOBILE_GRACE_UNTIL_KEY] < until) {
+        g[MOBILE_GRACE_UNTIL_KEY] = until;
+      }
+    } catch (_) {}
+  }
+
+  function inMobileLoadGrace() {
+    if (!preferDeferredHeavyWork()) return false;
+    try {
+      return Date.now() < (g[MOBILE_GRACE_UNTIL_KEY] || 0);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function bumpMobileLoadGrace(ms) {
+    if (!preferDeferredHeavyWork()) return;
+    const until = Date.now() + (ms > 0 ? ms : MOBILE_RESUME_GRACE_MS);
+    try {
+      if (!g[MOBILE_GRACE_UNTIL_KEY] || g[MOBILE_GRACE_UNTIL_KEY] < until) {
+        g[MOBILE_GRACE_UNTIL_KEY] = until;
+      }
+    } catch (_) {}
+  }
+
+  function installMobileResumeGraceListener() {
+    if (g.__thymerExtMobileGraceListenerInstalled) return;
+    g.__thymerExtMobileGraceListenerInstalled = true;
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+    document.addEventListener(
+      'visibilitychange',
+      () => {
+        try {
+          if (document.visibilityState === 'hidden') {
+            g[MOBILE_HIDDEN_AT_KEY] = Date.now();
+          } else if (document.visibilityState === 'visible') {
+            const hiddenAt = g[MOBILE_HIDDEN_AT_KEY] || 0;
+            const away = hiddenAt ? Date.now() - hiddenAt : 0;
+            if (away >= MOBILE_RESUME_AWAY_MS) bumpMobileLoadGrace(MOBILE_RESUME_GRACE_MS);
+          }
+        } catch (_) {}
+      },
+      { passive: true }
+    );
+  }
+
+  function pauseHeavyWorkQueue(ms) {
+    if (!preferDeferredHeavyWork()) return;
+    const until = Date.now() + (ms > 0 ? ms : MOBILE_HEAVY_PAUSE_ON_INTERACT_MS);
+    try {
+      if (!g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] || g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] < until) {
+        g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] = until;
+      }
+    } catch (_) {}
+  }
+
+  function isHeavyWorkQueuePaused() {
+    try {
+      return Date.now() < (g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] || 0);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /** True during startup window: skip footer mount / panel scans so page navigation stays responsive. */
+  function shouldDeferPanelFooterWork() {
+    return inMobileLoadGrace();
+  }
+
+  function installMobileInteractionGraceListener() {
+    if (g.__thymerExtMobileInteractGraceInstalled) return;
+    g.__thymerExtMobileInteractGraceInstalled = true;
+    if (!preferDeferredHeavyWork()) return;
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+
+    const onInteract = () => {
+      try {
+        const now = Date.now();
+        const prev = g[MOBILE_INTERACT_THROTTLE_AT_KEY] || 0;
+        if (now - prev < MOBILE_INTERACTION_THROTTLE_MS) return;
+        g[MOBILE_INTERACT_THROTTLE_AT_KEY] = now;
+        pauseHeavyWorkQueue(MOBILE_HEAVY_PAUSE_ON_INTERACT_MS);
+      } catch (_) {}
+    };
+
+    for (const ev of ['pointerdown', 'touchstart', 'keydown']) {
+      try {
+        document.addEventListener(ev, onInteract, { passive: true, capture: true });
+      } catch (_) {}
+    }
+  }
+
+  async function yieldToHostOneTick() {
+    await new Promise((r) => {
+      try {
+        requestAnimationFrame(() => requestAnimationFrame(() => r()));
+      } catch (_) {
+        setTimeout(r, 0);
+      }
+    });
+  }
+
+  async function runNextHeavyWork() {
+    if (g[HEAVY_BUSY_KEY]) return;
+    const q = g[HEAVY_Q_KEY];
+    if (!Array.isArray(q) || q.length === 0) return;
+    g[HEAVY_BUSY_KEY] = true;
+    try {
+      while (Array.isArray(g[HEAVY_Q_KEY]) && g[HEAVY_Q_KEY].length) {
+        if (inMobileLoadGrace() || isHeavyWorkQueuePaused()) break;
+        const job = g[HEAVY_Q_KEY].shift();
+        if (!job || typeof job.run !== 'function') continue;
+        try {
+          await yieldToHostOneTick();
+        } catch (_) {}
+        // Prefer running during idle; fallback is still serialized.
+        try {
+          if (typeof requestIdleCallback === 'function') {
+            await new Promise((resolve) => requestIdleCallback(resolve, { timeout: 1200 }));
+          }
+        } catch (_) {}
+        try {
+          await job.run();
+        } catch (_) {}
+        // Yield after each heavy job so navigation events can be processed.
+        try {
+          await yieldToHostOneTick();
+        } catch (_) {}
+      }
+    } finally {
+      g[HEAVY_BUSY_KEY] = false;
+      // If we stopped due to grace, try again later.
+      if (Array.isArray(g[HEAVY_Q_KEY]) && g[HEAVY_Q_KEY].length) {
+        setTimeout(() => runNextHeavyWork(), 1500);
+      }
+    }
+  }
+
+  function enqueueHeavyWork(run, opts) {
+    if (typeof run !== 'function') return;
+    if (!g[HEAVY_Q_KEY]) g[HEAVY_Q_KEY] = [];
+    const delayMs = Math.max(0, Number(opts?.delayMs) || 0);
+    const push = () => {
+      try {
+        g[HEAVY_Q_KEY].push({ run });
+      } catch (_) {}
+      setTimeout(() => runNextHeavyWork(), 0);
+    };
+    if (delayMs > 0) setTimeout(push, delayMs);
+    else push();
+  }
+
+  async function yieldToHostBeforePathB() {
+    await new Promise((r) => {
+      try {
+        requestAnimationFrame(() => requestAnimationFrame(() => r()));
+      } catch (_) {
+        r();
+      }
+    });
+    await new Promise((resolve) => {
+      try {
+        if (typeof requestIdleCallback === 'function') {
+          requestIdleCallback(() => resolve(), {
+            timeout: preferDeferredHeavyWork() ? 8000 : 1500,
+          });
+        } else {
+          setTimeout(resolve, preferDeferredHeavyWork() ? 48 : 16);
+        }
+      } catch (_) {
+        setTimeout(resolve, 32);
+      }
+    });
+  }
+
+  async function getAllCollectionsDeduped(data) {
+    if (!data || typeof data.getAllCollections !== 'function') return [];
+    const inflight = data[DATA_GET_ALL_P];
+    if (inflight && typeof inflight.then === 'function') {
+      try {
+        return await inflight;
+      } catch (_) {
+        // fall through to fresh fetch
+      }
+    }
+    const p = Promise.resolve()
+      .then(() => data.getAllCollections())
+      .then((all) => (Array.isArray(all) ? all : []))
+      .finally(() => {
+        try {
+          if (data[DATA_GET_ALL_P] === p) delete data[DATA_GET_ALL_P];
+        } catch (_) {}
+      });
+    data[DATA_GET_ALL_P] = p;
+    return p;
+  }
+
   /** If true, Thymer ignores programmatic field updates — force off on every schema save. */
   const MANAGED_UNLOCK = { fields: false, views: false, sidebar: false };
 
@@ -785,12 +1016,66 @@
     return false;
   }
 
+  /** Parse ISO-ish timestamps for vault row scoring (duplicates: pick freshest, not first in list). */
+  function parseVaultIsoMs(s) {
+    const n = Date.parse(String(s || ''));
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function vaultRowFreshnessScore(r) {
+    let score = 0;
+    let raw = '';
+    try {
+      raw = rowField(r, 'settings_json');
+    } catch (_) {}
+    if (raw && String(raw).trim()) {
+      try {
+        const j = JSON.parse(raw);
+        if (j && typeof j.updatedAt === 'string') {
+          const ms = parseVaultIsoMs(j.updatedAt);
+          if (ms > score) score = ms;
+        }
+      } catch (_) {}
+    }
+    try {
+      const ua = rowField(r, 'updated_at');
+      if (ua) {
+        const ms = parseVaultIsoMs(ua);
+        if (ms > score) score = ms;
+      }
+    } catch (_) {}
+    return score;
+  }
+
+  function settingsJsonPayloadLen(r) {
+    try {
+      return String(rowField(r, 'settings_json') || '').length;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /**
+   * Prefer the **newest** vault row when duplicates exist (same `plugin_id`, multiple vault-shaped rows).
+   * Previously the first list match could be stale while a newer row held the real payload.
+   */
   function findVaultRecord(records, pluginId) {
     if (!records) return null;
+    let best = null;
+    let bestScore = -1;
     for (const x of records) {
-      if (isVaultRow(x, pluginId)) return x;
+      if (!isVaultRow(x, pluginId)) continue;
+      const sc = vaultRowFreshnessScore(x);
+      if (sc > bestScore) {
+        bestScore = sc;
+        best = x;
+      } else if (sc === bestScore && best) {
+        const lenX = settingsJsonPayloadLen(x);
+        const lenB = settingsJsonPayloadLen(best);
+        if (lenX > lenB) best = x;
+      }
     }
-    return null;
+    return best;
   }
 
   function applyVaultRowMeta(r, pluginId, coll) {
@@ -900,7 +1185,7 @@
   async function countExactPluginBackendNamedCollections(data) {
     let all;
     try {
-      all = await data.getAllCollections();
+      all = await getAllCollectionsDeduped(data);
     } catch (_) {
       return 0;
     }
@@ -1110,7 +1395,7 @@
 
   async function findColl(data) {
     try {
-      const all = await data.getAllCollections();
+      const all = await getAllCollectionsDeduped(data);
       return pickCollFromAll(all);
     } catch (_) {
       return null;
@@ -1119,13 +1404,12 @@
 
   /** Brute list scan — catches a Backend another iframe just created if `findColl` lags. */
   async function hasPluginBackendOnWorkspace(data) {
-    let all;
     try {
-      all = await data.getAllCollections();
+      const all = await getAllCollectionsDeduped(data);
+      return hasPluginBackendInAll(all);
     } catch (_) {
       return false;
     }
-    return hasPluginBackendInAll(all);
   }
 
   const PB_LOCK_NAME = 'thymer-ext-plugin-backend-ensure-v1';
@@ -1231,7 +1515,7 @@
       dlogPathB('ensureBody_start', { pathB: pathBWindowSnapshot() });
       try {
         if (data && data.getAllCollections) {
-          const a = await data.getAllCollections();
+          const a = await getAllCollectionsDeduped(data);
           const list = Array.isArray(a) ? a : [];
           const collNames = list.map((c) => {
             try { return String(collectionDisplayName(c) || '').trim() || '(no-name)'; } catch (__) { return '(err)'; }
@@ -1270,7 +1554,7 @@
       for (let attempt = 0; attempt < 4; attempt++) {
         let allAttempt;
         try {
-          allAttempt = await data.getAllCollections();
+          allAttempt = await getAllCollectionsDeduped(data);
         } catch (_) {
           allAttempt = null;
         }
@@ -1299,7 +1583,7 @@
       }
       let allPost;
       try {
-        allPost = await data.getAllCollections();
+        allPost = await getAllCollectionsDeduped(data);
       } catch (_) {
         allPost = null;
       }
@@ -1327,7 +1611,7 @@
       await new Promise((r) => setTimeout(r, 120));
       let allAfterWait;
       try {
-        allAfterWait = await data.getAllCollections();
+        allAfterWait = await getAllCollectionsDeduped(data);
       } catch (_) {
         allAfterWait = null;
       }
@@ -1353,14 +1637,14 @@
       let preCreateLen = 0;
       try {
         if (data && data.getAllCollections) {
-          const all0 = await data.getAllCollections();
+          const all0 = await getAllCollectionsDeduped(data);
           preCreateLen = Array.isArray(all0) ? all0.length : 0;
           if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
         }
         if (preCreateLen === 0) {
           await new Promise((r) => setTimeout(r, 150));
           if (data && data.getAllCollections) {
-            const all1 = await data.getAllCollections();
+            const all1 = await getAllCollectionsDeduped(data);
             preCreateLen = Array.isArray(all1) ? all1.length : 0;
             if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
           }
@@ -1368,7 +1652,7 @@
         if (preCreateLen > 0) {
           let allPre;
           try {
-            allPre = await data.getAllCollections();
+            allPre = await getAllCollectionsDeduped(data);
           } catch (_) {
             allPre = null;
           }
@@ -1412,7 +1696,7 @@
       try {
         let allLease;
         try {
-          allLease = await data.getAllCollections();
+          allLease = await getAllCollectionsDeduped(data);
         } catch (_) {
           allLease = null;
         }
@@ -1442,7 +1726,7 @@
             await new Promise((r) => setTimeout(r, 130 + i * 70));
             let allCont;
             try {
-              allCont = await data.getAllCollections();
+              allCont = await getAllCollectionsDeduped(data);
             } catch (_) {
               allCont = null;
             }
@@ -1475,7 +1759,7 @@
             await new Promise((r) => setTimeout(r, 120 + i * 60));
             let allSettle;
             try {
-              allSettle = await data.getAllCollections();
+              allSettle = await getAllCollectionsDeduped(data);
             } catch (_) {
               allSettle = null;
             }
@@ -1933,8 +2217,18 @@
     createDataRow,
     upgradeCollectionSchema: (data) => upgradePluginSettingsSchema(data),
     registerPluginSlug,
+    preferDeferredHeavyWork,
+    yieldToHostBeforePathB,
+    ensureMobileLoadGraceStarted,
+    inMobileLoadGrace,
+    bumpMobileLoadGrace,
+    installMobileResumeGraceListener,
 
     async init(opts) {
+      ensureMobileLoadGraceStarted();
+      installMobileResumeGraceListener();
+      installMobileInteractionGraceListener();
+      await yieldToHostBeforePathB();
       const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
 
       let mode = null;
@@ -2092,6 +2386,15 @@
       });
     },
   };
+
+  g.thymerExtEnsureMobileLoadGrace = ensureMobileLoadGraceStarted;
+  g.thymerExtInMobileLoadGrace = inMobileLoadGrace;
+  g.thymerExtShouldDeferPanelFooterWork = shouldDeferPanelFooterWork;
+  g.thymerExtBumpMobileLoadGrace = bumpMobileLoadGrace;
+  g.thymerExtPauseHeavyWorkQueue = pauseHeavyWorkQueue;
+  g.thymerExtInstallMobileResumeGrace = installMobileResumeGraceListener;
+  g.thymerExtInstallMobileInteractionGrace = installMobileInteractionGraceListener;
+  g.thymerExtEnqueueHeavyWork = enqueueHeavyWork;
 })(typeof globalThis !== 'undefined' ? globalThis : window);
 // @generated END thymer-plugin-settings
 
@@ -3008,15 +3311,7 @@ class Plugin extends CollectionPlugin {
     const hasMountKey = c && Object.prototype.hasOwnProperty.call(c, 'mount_journal_income_widget');
     this._mountJournalIncomeWidget = hasMountKey ? c.mount_journal_income_widget !== false : false;
     globalThis.__ynabBusinessPlugin = this;
-    await (globalThis.ThymerPluginSettings?.init?.({
-      plugin: this,
-      pluginId: 'ynab',
-      modeKey: 'thymerext_ps_mode_ynab',
-      mirrorKeys: () => Object.values(SK),
-      label: 'YNAB',
-      data: this.data,
-      ui: this.ui,
-    }) ?? (console.warn('[YNAB] ThymerPluginSettings runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
+    void this._ynabRunDeferredPathB();
     this._panelStates    = new Map();
     this._eventIds       = [];
     this._chartInstances = new Map();
@@ -3096,6 +3391,35 @@ class Plugin extends CollectionPlugin {
     } catch (_) {}
     setTimeout(() => { const p = this.ui.getActivePanel(); if (p) this._handlePanel(p); }, 120);
     // No auto-sync on load — sync is manual only (avoids freezing on large budgets)
+  }
+
+  async _ynabRunDeferredPathB() {
+    try {
+      await (globalThis.ThymerPluginSettings?.yieldToHostBeforePathB?.() ?? new Promise((r) => {
+        try {
+          if (typeof requestIdleCallback === 'function') {
+            requestIdleCallback(() => r(), { timeout: 5000 });
+          } else {
+            setTimeout(r, 900);
+          }
+        } catch (_) {
+          setTimeout(r, 900);
+        }
+      }));
+      await (globalThis.ThymerPluginSettings?.init?.({
+        plugin: this,
+        pluginId: 'ynab',
+        modeKey: 'thymerext_ps_mode_ynab',
+        mirrorKeys: () => Object.values(SK),
+        label: 'YNAB',
+        data: this.data,
+        ui: this.ui,
+      }) ?? (console.warn('[YNAB] ThymerPluginSettings runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
+    } catch (e) {
+      try {
+        console.warn('[YNAB] deferred Path B init', e);
+      } catch (_) {}
+    }
   }
 
   onUnload() {
