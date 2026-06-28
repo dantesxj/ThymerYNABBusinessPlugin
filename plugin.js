@@ -87,6 +87,8 @@
   const MOBILE_RESUME_AWAY_MS = 15000;
   /** Interaction only pauses the heavy-work queue briefly — do not extend MOBILE_GRACE. */
   const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 8000;
+  /** Desktop: brief heavy-work pause after first click during startup storm. */
+  const DESKTOP_HEAVY_PAUSE_ON_INTERACT_MS = 6000;
   const MOBILE_INTERACTION_THROTTLE_MS = 2500;
   const HEAVY_QUEUE_PAUSED_UNTIL_KEY = '__thymerExtHeavyQueuePausedUntil';
 
@@ -154,12 +156,20 @@
   }
 
   function installStartupStormInteractionListener() {
+    g.__thymerExtStormOnInteract = () => {
+      try {
+        endStartupStormWindow();
+        pauseHeavyWorkQueue(
+          preferDeferredHeavyWork() ? MOBILE_HEAVY_PAUSE_ON_INTERACT_MS : DESKTOP_HEAVY_PAUSE_ON_INTERACT_MS
+        );
+      } catch (_) {}
+    };
     if (g.__thymerExtStormInteractInstalled) return;
     g.__thymerExtStormInteractInstalled = true;
     if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
     const onInteract = () => {
       try {
-        endStartupStormWindow();
+        g.__thymerExtStormOnInteract?.();
       } catch (_) {}
     };
     for (const ev of ['pointerdown', 'touchstart', 'keydown']) {
@@ -3483,7 +3493,6 @@ class Plugin extends AppPlugin {
       const reg = globalThis.__thymerExtDashboardOpeners || (globalThis.__thymerExtDashboardOpeners = {});
       reg['YNAB'] = { icon: 'ti-coin', open: () => { void this.openDashboardModal(); } };
     } catch (_) {}
-    void this._ynabRunDeferredPathB();
     this._panelStates    = new Map();
     this._eventIds       = [];
     this._chartInstances = new Map();
@@ -3520,7 +3529,8 @@ class Plugin extends AppPlugin {
       label: 'YNAB: Storage location…',
       icon: 'ti-database',
       onSelected: () => {
-        globalThis.ThymerPluginSettings?.openStorageDialog?.({
+        void this._ynabEnsurePathBReady().then(() => {
+          globalThis.ThymerPluginSettings?.openStorageDialog?.({
           plugin: this,
           pluginId: 'ynab',
           modeKey: 'thymerext_ps_mode_ynab',
@@ -3528,6 +3538,7 @@ class Plugin extends AppPlugin {
           label: 'YNAB',
           data: this.data,
           ui: this.ui,
+        });
         });
       },
     });
@@ -3566,6 +3577,13 @@ class Plugin extends AppPlugin {
     } catch (_) {}
     setTimeout(() => { const p = this.ui.getActivePanel(); if (p) this._handlePanel(p); }, 120);
     // No auto-sync on load — sync is manual only (avoids freezing on large budgets)
+    diag?.record?.('YNAB_ONLOAD_END');
+  }
+
+  _ynabEnsurePathBReady() {
+    if (this._ynabPathBReadyPromise) return this._ynabPathBReadyPromise;
+    this._ynabPathBReadyPromise = this._ynabRunDeferredPathB().catch(() => {});
+    return this._ynabPathBReadyPromise;
   }
 
   async _ynabRunDeferredPathB() {
@@ -3640,8 +3658,9 @@ class Plugin extends AppPlugin {
     this._dashBackdrop = null;
   }
 
-  openDashboardModal() {
+  async openDashboardModal() {
     if (this._dashBackdrop) return;
+    await this._ynabEnsurePathBReady();
     globalThis.__thymerDiag?.record?.('YNAB_PANEL_OPEN');
     const self = this;
     const backdrop = document.createElement('div');
@@ -4529,6 +4548,7 @@ class Plugin extends AppPlugin {
   // per batch — instead of one getAllRecords() per record (which froze at scale).
 
   async _syncAll(force = false) {
+    await this._ynabEnsurePathBReady();
     const token = ls(SK.TOKEN), budgetId = ls(SK.BUDGET_ID);
     if (!token || !budgetId) {
       this.ui.addToaster({title:'YNAB',message:'Configure token first',dismissible:true,autoDestroyTime:5000});
@@ -4846,7 +4866,8 @@ class Plugin extends AppPlugin {
 
   // ── Config dialog ───────────────────────────────────────────────────────────
 
-  _showConfigDialog() {
+  async _showConfigDialog() {
+    await this._ynabEnsurePathBReady();
     const overlay = document.createElement('div'); overlay.className='ynab-overlay';
     const dialog  = document.createElement('div'); dialog.className='ynab-dialog';
 
