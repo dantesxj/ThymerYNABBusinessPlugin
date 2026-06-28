@@ -1,6 +1,6 @@
 // ==Plugin==
 // name: YNAB
-// description: YNAB dashboard and transaction sync
+// description: Global plugin — YNAB dashboard and transaction sync
 // icon: ti-coin
 // ==/Plugin==
 
@@ -81,28 +81,104 @@
   const MOBILE_GRACE_UNTIL_KEY = '__thymerExtMobileGraceUntil';
   const MOBILE_HIDDEN_AT_KEY = '__thymerExtMobileHiddenAt';
   const MOBILE_INTERACT_THROTTLE_AT_KEY = '__thymerExtMobileInteractThrottleAt';
-  /** Pause footer scans / Path B until host sidebar is up — keep short so navigation is not blocked for ~2 min. */
-  const MOBILE_GRACE_MS = 45000;
-  const MOBILE_RESUME_GRACE_MS = 35000;
+  /** Mobile: pause heavy-work queue briefly so navigation stays responsive. Desktop: no grace gate. */
+  const MOBILE_GRACE_MS = 32000;
+  const MOBILE_RESUME_GRACE_MS = 20000;
   const MOBILE_RESUME_AWAY_MS = 15000;
-  /** Interaction only pauses the heavy-work queue briefly — do not extend MOBILE_GRACE (that delayed page change until ~2 min). */
-  const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 10000;
+  /** Interaction only pauses the heavy-work queue briefly — do not extend MOBILE_GRACE. */
+  const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 8000;
   const MOBILE_INTERACTION_THROTTLE_MS = 2500;
   const HEAVY_QUEUE_PAUSED_UNTIL_KEY = '__thymerExtHeavyQueuePausedUntil';
+
+  /** Cross-platform: defer vault scans / footer data populate while Thymer syncs; shells may still mount. */
+  const STARTUP_STORM_UNTIL_KEY = '__thymerExtStartupStormUntil';
+  const STARTUP_STORM_MOBILE_MS = 38000;
+  const STARTUP_STORM_DESKTOP_MS = 14000;
 
   // Heavy work scheduler: many plugins "wake up" together after mobile grace ends.
   // Running them concurrently causes long-task storms that block navigation.
   const HEAVY_Q_KEY = '__thymerExtHeavyWorkQueue';
   const HEAVY_BUSY_KEY = '__thymerExtHeavyWorkBusy';
 
+  function ensureStartupStormWindow(extraMs) {
+    const ms =
+      extraMs > 0
+        ? extraMs
+        : preferDeferredHeavyWork()
+          ? STARTUP_STORM_MOBILE_MS
+          : STARTUP_STORM_DESKTOP_MS;
+    const until = Date.now() + ms;
+    try {
+      if (!g[STARTUP_STORM_UNTIL_KEY] || g[STARTUP_STORM_UNTIL_KEY] < until) {
+        g[STARTUP_STORM_UNTIL_KEY] = until;
+      }
+    } catch (_) {}
+    installStartupStormInteractionListener();
+  }
+
+  function inStartupStormWindow() {
+    try {
+      return Date.now() < (g[STARTUP_STORM_UNTIL_KEY] || 0);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function endStartupStormWindow() {
+    try {
+      g[STARTUP_STORM_UNTIL_KEY] = 0;
+    } catch (_) {}
+  }
+
+  function scheduleAfterStartupStorm(run, opts) {
+    if (typeof run !== 'function') return;
+    if (!inStartupStormWindow()) {
+      try {
+        run();
+      } catch (_) {}
+      return;
+    }
+    const pollMs = Math.max(120, Number(opts?.pollMs) || 400);
+    const maxWaitMs = Math.max(pollMs, Number(opts?.maxWaitMs) || 120000);
+    const started = Date.now();
+    const tick = () => {
+      if (!inStartupStormWindow() || Date.now() - started >= maxWaitMs) {
+        try {
+          run();
+        } catch (_) {}
+        return;
+      }
+      setTimeout(tick, pollMs);
+    };
+    setTimeout(tick, pollMs);
+  }
+
+  function installStartupStormInteractionListener() {
+    if (g.__thymerExtStormInteractInstalled) return;
+    g.__thymerExtStormInteractInstalled = true;
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+    const onInteract = () => {
+      try {
+        endStartupStormWindow();
+      } catch (_) {}
+    };
+    for (const ev of ['pointerdown', 'touchstart', 'keydown']) {
+      try {
+        document.addEventListener(ev, onInteract, { passive: true, capture: true });
+      } catch (_) {}
+    }
+  }
+
   function ensureMobileLoadGraceStarted(extraMs) {
     if (!preferDeferredHeavyWork()) return;
+    ensureStartupStormWindow();
     const until = Date.now() + (extraMs > 0 ? extraMs : MOBILE_GRACE_MS);
     try {
       if (!g[MOBILE_GRACE_UNTIL_KEY] || g[MOBILE_GRACE_UNTIL_KEY] < until) {
         g[MOBILE_GRACE_UNTIL_KEY] = until;
       }
     } catch (_) {}
+    installStartupStormInteractionListener();
   }
 
   function inMobileLoadGrace() {
@@ -163,9 +239,36 @@
     }
   }
 
-  /** True during startup window: skip footer mount / panel scans so page navigation stays responsive. */
+  /**
+   * True during the brief startup window — use only to skip *background* sync scans,
+   * not user-initiated panel.navigated mounts (those should still schedule with debounce).
+   */
   function shouldDeferPanelFooterWork() {
     return inMobileLoadGrace();
+  }
+
+  /** Run `fn` now, or poll until mobile load grace ends (for one-shot startup scans that must not be dropped). */
+  function scheduleAfterMobileLoadGrace(run, opts) {
+    if (typeof run !== 'function') return;
+    if (!preferDeferredHeavyWork() || !inMobileLoadGrace()) {
+      try {
+        run();
+      } catch (_) {}
+      return;
+    }
+    const pollMs = Math.max(120, Number(opts?.pollMs) || 350);
+    const maxWaitMs = Math.max(pollMs, Number(opts?.maxWaitMs) || 90000);
+    const started = Date.now();
+    const tick = () => {
+      if (!inMobileLoadGrace() || Date.now() - started >= maxWaitMs) {
+        try {
+          run();
+        } catch (_) {}
+        return;
+      }
+      setTimeout(tick, pollMs);
+    };
+    setTimeout(tick, pollMs);
   }
 
   function installMobileInteractionGraceListener() {
@@ -180,6 +283,7 @@
         const prev = g[MOBILE_INTERACT_THROTTLE_AT_KEY] || 0;
         if (now - prev < MOBILE_INTERACTION_THROTTLE_MS) return;
         g[MOBILE_INTERACT_THROTTLE_AT_KEY] = now;
+        endStartupStormWindow();
         pauseHeavyWorkQueue(MOBILE_HEAVY_PAUSE_ON_INTERACT_MS);
       } catch (_) {}
     };
@@ -232,7 +336,7 @@
       g[HEAVY_BUSY_KEY] = false;
       // If we stopped due to grace, try again later.
       if (Array.isArray(g[HEAVY_Q_KEY]) && g[HEAVY_Q_KEY].length) {
-        setTimeout(() => runNextHeavyWork(), 1500);
+        setTimeout(() => runNextHeavyWork(), inMobileLoadGrace() ? 450 : 200);
       }
     }
   }
@@ -2225,7 +2329,7 @@
     installMobileResumeGraceListener,
 
     async init(opts) {
-      ensureMobileLoadGraceStarted();
+      ensureStartupStormWindow();
       installMobileResumeGraceListener();
       installMobileInteractionGraceListener();
       await yieldToHostBeforePathB();
@@ -2396,6 +2500,11 @@
   g.thymerExtInstallMobileResumeGrace = installMobileResumeGraceListener;
   g.thymerExtInstallMobileInteractionGrace = installMobileInteractionGraceListener;
   g.thymerExtEnqueueHeavyWork = enqueueHeavyWork;
+  g.thymerExtScheduleAfterMobileLoadGrace = scheduleAfterMobileLoadGrace;
+  g.thymerExtEnsureStartupStormWindow = ensureStartupStormWindow;
+  g.thymerExtInStartupStormWindow = inStartupStormWindow;
+  g.thymerExtEndStartupStormWindow = endStartupStormWindow;
+  g.thymerExtScheduleAfterStartupStorm = scheduleAfterStartupStorm;
 })(typeof globalThis !== 'undefined' ? globalThis : window);
 // @generated END thymer-plugin-settings
 
@@ -2471,6 +2580,39 @@ const lsSet   = (k,v)=> { try { localStorage.setItem(k, String(v)); } catch {} y
 const lsJson  = (k,d)=> { try { const v = ls(k); return v ? JSON.parse(v) : d; } catch { return d; } };
 const lsJsonSet=(k,v)=> { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} ynabPluginSettingsFlush(); };
 const sleep   = ms   => new Promise(r => setTimeout(r, ms));
+
+/** Thymer datetime fields require DateTimeValue — not raw Date (SDK/runtime). */
+function ynabSetDateTimeProp(prop, date) {
+  if (!prop || !date) return;
+  const d = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(d.getTime())) return;
+  try {
+    if (typeof prop.setFromDate === 'function') {
+      prop.setFromDate(d);
+      return;
+    }
+  } catch (_) {}
+  try {
+    if (typeof DateTime !== 'undefined' && typeof DateTime.fromDate === 'function') {
+      prop.set(DateTime.fromDate(d).value());
+      return;
+    }
+  } catch (_) {}
+  try {
+    if (typeof DateTime !== 'undefined' && typeof DateTime.parseDateTimeString === 'function') {
+      const pad = (n) => String(n).padStart(2, '0');
+      const s = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+      prop.set(DateTime.parseDateTimeString(s).value());
+    }
+  } catch (_) {}
+}
+
+function ynabSetYmdDateProp(prop, ymd) {
+  if (!prop || !ymd) return;
+  const parts = String(ymd).trim().split('-').map(Number);
+  if (parts.length < 3 || parts.some((n) => !Number.isFinite(n))) return;
+  ynabSetDateTimeProp(prop, new Date(parts[0], parts[1] - 1, parts[2], 12, 0, 0, 0));
+}
 
 function fmt(n) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n);
@@ -3212,6 +3354,29 @@ const CSS = `
   .ynab-cfg-icon { font-size: 48px; opacity: 0.45; }
   .ynab-cfg-title { font-size: 18px; font-weight: 600; color: ${C.text}; }
   .ynab-cfg-sub { font-size: 13px; color: ${C.statLabel}; }
+
+  .ynab-dash-backdrop {
+    position: fixed; inset: 0; z-index: 99998;
+    display: flex; align-items: flex-start; justify-content: center;
+    padding: 24px 16px; overflow: auto;
+    background: rgba(0,0,0,0.62);
+    -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
+  }
+  .ynab-dash-card {
+    width: min(1200px, 100%); max-height: calc(100vh - 48px);
+    display: flex; flex-direction: column; border-radius: 12px;
+    color: ${C.text}; background: rgba(28, 26, 22, 0.92);
+    border: 1px solid rgba(255,255,255,0.12);
+    box-shadow: 0 20px 60px rgba(0,0,0,0.55);
+    -webkit-backdrop-filter: blur(24px) saturate(1.45);
+    backdrop-filter: blur(24px) saturate(1.45);
+  }
+  .ynab-dash-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 16px 20px 12px; border-bottom: 1px solid rgba(255,255,255,0.08); flex-shrink: 0;
+  }
+  .ynab-dash-head h2 { margin: 0; font-size: 18px; font-weight: 700; color: ${C.text}; }
+  .ynab-dash-body { overflow: auto; flex: 1; min-height: 0; padding: 0 4px 12px; }
 `;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3267,12 +3432,14 @@ function _ynabStubViewMethods(view) {
   });
 }
 
-class Plugin extends CollectionPlugin {
+class Plugin extends AppPlugin {
 
   /** One `getAllCollections` per workspace after the YNAB collection is found (cleared on unload). */
   _ynabCollsKey = null;
   _ynabCollsResolved = false;
   _ynabTxnColl = null;
+  _dashBackdrop = null;
+  _dashRefreshTimer = null;
   /** `injectCSS` must run once — repeated calls (plugin reload) can thrash layout. */
   _ynabUiCssInstalled = false;
   /**
@@ -3312,6 +3479,10 @@ class Plugin extends CollectionPlugin {
     const hasMountKey = c && Object.prototype.hasOwnProperty.call(c, 'mount_journal_income_widget');
     this._mountJournalIncomeWidget = hasMountKey ? c.mount_journal_income_widget !== false : false;
     globalThis.__ynabBusinessPlugin = this;
+    try {
+      const reg = globalThis.__thymerExtDashboardOpeners || (globalThis.__thymerExtDashboardOpeners = {});
+      reg['YNAB'] = { icon: 'ti-coin', open: () => { void this.openDashboardModal(); } };
+    } catch (_) {}
     void this._ynabRunDeferredPathB();
     this._panelStates    = new Map();
     this._eventIds       = [];
@@ -3328,7 +3499,10 @@ class Plugin extends CollectionPlugin {
         this._ynabUiCssInstalled = false;
       }
     }
-    this.views.register('Dashboard', ctx => this._dashboardView(ctx));
+    this._cmdOpenDash = this.ui.addCommandPaletteCommand({
+      label: 'YNAB: Open dashboard', icon: 'ti-dashboard',
+      onSelected: () => { void this.openDashboardModal(); },
+    });
 
     this._eventIds.push(this.events.on('panel.navigated', ev => this._deferHandlePanel(ev.panel)));
     this._eventIds.push(this.events.on('panel.focused',   ev => this._handlePanel(ev.panel)));
@@ -3426,6 +3600,11 @@ class Plugin extends CollectionPlugin {
   onUnload() {
     if (globalThis.__ynabBusinessPlugin === this) globalThis.__ynabBusinessPlugin = undefined;
     if (globalThis.__ynabPluginSettingsPlugin === this) globalThis.__ynabPluginSettingsPlugin = undefined;
+    this._closeDashboardModal();
+    try {
+      const reg = globalThis.__thymerExtDashboardOpeners;
+      if (reg && reg['YNAB']) delete reg['YNAB'];
+    } catch (_) {}
     this._ynabUiCssInstalled = false;
     this._ynabCollsKey = null;
     this._ynabCollsResolved = false;
@@ -3434,6 +3613,7 @@ class Plugin extends CollectionPlugin {
     this._eventIds = [];
     for (const t of (this._ynNavTimers || new Map()).values()) { try { clearTimeout(t); } catch {} }
     this._ynNavTimers?.clear();
+    this._cmdOpenDash?.remove?.();
     this._cmdSync?.remove?.();
     this._cmdCfg?.remove?.();
     this._cmdStorage?.remove?.();
@@ -3449,84 +3629,65 @@ class Plugin extends CollectionPlugin {
 
   // ── Dashboard view ──────────────────────────────────────────────────────────
 
-  _dashboardView(ctx) {
-    let el, container;
-    let refreshTimer = null;
-    const dashKey = `ynab-dash-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-    /**
-     * If the user is mid-type (date range, filter input, search box, …) we don’t want
-     * to wipe out their focus by re-rendering. Re-arm the timer for another 1200ms and
-     * try again later. Otherwise the previous typing fix becomes “focus thrashing.”
-     */
+  _closeDashboardModal() {
+    globalThis.__thymerDiag?.record?.('YNAB_PANEL_CLOSE');
+    if (this._dashRefreshTimer != null) {
+      try { clearTimeout(this._dashRefreshTimer); } catch (_) {}
+      this._dashRefreshTimer = null;
+    }
+    try { this._dashRefreshers?.delete('modal'); } catch (_) {}
+    try { this._dashBackdrop?.remove?.(); } catch (_) {}
+    this._dashBackdrop = null;
+  }
+
+  openDashboardModal() {
+    if (this._dashBackdrop) return;
+    globalThis.__thymerDiag?.record?.('YNAB_PANEL_OPEN');
+    const self = this;
+    const backdrop = document.createElement('div');
+    backdrop.className = 'ynab-dash-backdrop';
+    const card = document.createElement('div');
+    card.className = 'ynab-dash-card';
+    const head = document.createElement('div');
+    head.className = 'ynab-dash-head';
+    const h2 = document.createElement('h2');
+    h2.textContent = 'YNAB';
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'ynab-btn';
+    closeBtn.type = 'button';
+    closeBtn.textContent = 'Close';
+    closeBtn.addEventListener('click', () => self._closeDashboardModal());
+    head.appendChild(h2);
+    head.appendChild(closeBtn);
+    card.appendChild(head);
+    const container = document.createElement('div');
+    container.className = 'ynab-dash-body';
+    card.appendChild(container);
+    backdrop.appendChild(card);
+    backdrop.addEventListener('click', (e) => {
+      if (e.target === backdrop) self._closeDashboardModal();
+    });
+    document.body.appendChild(backdrop);
+    this._dashBackdrop = backdrop;
+
     const tick = () => {
-      refreshTimer = null;
+      this._dashRefreshTimer = null;
       if (!container) return;
       if (_ynabIsUserEditingInside(container)) {
         globalThis.__thymerDiag?.record?.('YNAB_PANEL_REFRESH_DEFERRED_TYPING');
-        refreshTimer = setTimeout(tick, 1200);
+        this._dashRefreshTimer = setTimeout(tick, 1200);
         return;
       }
       void this._renderDash(container);
     };
-    /**
-     * `debouncedRefresh` is invoked exclusively by our own code now (see the
-     * `onRefresh` block comment below). We register it in `_dashRefreshers` so
-     * sync (`_syncAll`) and any future "data changed, please repaint" call sites
-     * can iterate the map and fire each open dashboard. Coalesces a tight burst
-     * of internal triggers into a single render.
-     */
     const debouncedRefresh = () => {
       globalThis.__thymerDiag?.record?.('YNAB_PANEL_REFRESH_FIRED');
-      if (refreshTimer != null) clearTimeout(refreshTimer);
-      refreshTimer = setTimeout(tick, 400);
+      if (this._dashRefreshTimer != null) clearTimeout(this._dashRefreshTimer);
+      this._dashRefreshTimer = setTimeout(tick, 400);
     };
-    return _ynabStubViewMethods({
-      onLoad: () => {
-        globalThis.__thymerDiag?.record?.('YNAB_PANEL_OPEN');
-        ctx.makeWideLayout?.();
-        el = ctx.getElement();
-        el.style.overflow = 'auto';
-        container = document.createElement('div');
-        el.appendChild(container);
-        if (!this._dashRefreshers) this._dashRefreshers = new Map();
-        this._dashRefreshers.set(dashKey, debouncedRefresh);
-        void this._renderDash(container);
-      },
-      /**
-       * **Manual refresh model** — Thymer fires `onRefresh` on every open panel for
-       * every collection write, including from sibling plugins (e.g. Bilt writes
-       * to Plugin Backend → all YNAB dashboards repaint). For a panel that parses
-       * 1500+ cached transactions and rebuilds dozens of charts, that cascade was
-       * causing visible jank and dashboard flicker.
-       *
-       * The dashboard now repaints only when:
-       *  - The panel is opened (initial render)
-       *  - The user clicks the in-dashboard "Refresh" button
-       *  - `_syncAll` finishes (we iterate `_dashRefreshers` after the sync writes)
-       *  - Any future internal write site explicitly fires its dashKey's refresher
-       *
-       * If you ever want the old auto-repaint-on-every-write behavior back, swap the
-       * body below for `debouncedRefresh()`. Recorded as `YNAB_PANEL_REFRESH_IGNORED`
-       * so the deep-instrumentation diagnostic can confirm we're skipping these.
-       */
-      onRefresh: () => {
-        globalThis.__thymerDiag?.record?.('YNAB_PANEL_REFRESH_IGNORED');
-      },
-      onDestroy: () => {
-        globalThis.__thymerDiag?.record?.('YNAB_PANEL_CLOSE');
-        if (refreshTimer != null) {
-          try {
-            clearTimeout(refreshTimer);
-          } catch (_) {}
-          refreshTimer = null;
-        }
-        try {
-          this._dashRefreshers?.delete(dashKey);
-        } catch (_) {}
-        container = null;
-        el = null;
-      },
-    });
+    if (!this._dashRefreshers) this._dashRefreshers = new Map();
+    this._dashRefreshers.set('modal', debouncedRefresh);
+    void this._renderDash(container);
   }
 
   /**
@@ -4439,19 +4600,7 @@ class Plugin extends CollectionPlugin {
         for (const { txn, guid } of guids) {
           const record = byGuid.get(guid);
           if (!record) continue;
-          // Use Thymer's DateTime.dateOnly() — month is 0-indexed per SDK reference
-          const [dy, dm, dd] = txn.date.split('-').map(Number);
-          const dateProp = record.prop('date');
-          if (dateProp) {
-            try {
-              // DateTime.dateOnly is the correct Thymer SDK method for date-only fields
-              const dt = DateTime.dateOnly(dy, dm - 1, dd);
-              dateProp.set(dt.value());
-            } catch(_) {
-              // Fallback: plain Date object
-              try { dateProp.set(new Date(dy, dm - 1, dd, 12, 0, 0)); } catch(__) {}
-            }
-          }
+          ynabSetYmdDateProp(record.prop('date'), txn.date);
           record.prop('payee')?.set(txn.payee);
           record.prop('amount')?.set(txn.amount);
           record.prop('category')?.set(txn.category);
@@ -4459,7 +4608,7 @@ class Plugin extends CollectionPlugin {
           record.prop('memo')?.set(txn.memo);
           record.prop('account')?.set(txn.account);
           record.prop('ynab_id')?.set(txn.id);
-          record.prop('synced_at')?.set(new Date());
+          ynabSetDateTimeProp(record.prop('synced_at'), new Date());
           record.prop('cleared')?.setChoice?.(clearedMap[txn.cleared] || 'Uncleared');
           record.prop('transaction_type')?.setChoice?.(txn.type === 'income' ? 'Income' : 'Expense');
           created++;
