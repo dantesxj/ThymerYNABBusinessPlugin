@@ -1,2528 +1,81 @@
 // ==Plugin==
-// name: YNAB
-// description: Global plugin — YNAB dashboard and transaction sync
-// icon: ti-coin
+// @id: dawn-ynab
+// @name: YNAB
+// @description: JHS income tab + dashboard — cache paint; sync/token onDemand; no nav scans
+// @icon: ti-coin
 // ==/Plugin==
 
 /**
- * Diagnostic instrumentation calls below (`globalThis.__thymerDiag?.record?.(...)` and
- * the panic gate) are no-ops unless the standalone **Thymer Diagnostics** plugin is
- * loaded. That plugin owns the runtime, command palette commands, and the live diag
- * dashboard — install/enable it when something feels wrong, disable it when not.
+ * Dawn YNAB — standalone JHS tab plugin.
+ *
+ * Deploy: cat plugin.js ynab-engine.js
+ *
+ * CONTRACT:
+ * - registerTab('ynab') on Journal Header Shell.
+ * - onDay = cache paint only. Chart.js / sync / collection onDemand.
+ * - Hydrates prod Path B `ynab` vault (`ynab_pat` etc.) into `dawn:ynab_*`.
+ * - Never getAllRecords on panel.navigated.
  */
 
-// @generated BEGIN thymer-plugin-settings (source: plugins/public repo/plugin-settings/ThymerPluginSettingsRuntime.js — run: npm run embed-plugin-settings)
-/**
- * ThymerPluginSettings — workspace **Plugin Backend** collection + optional localStorage mirror
- * for global plugins that do not own a collection. (Legacy name **Plugin Settings** is still found until renamed.)
- *
- * Edit this file, then from repo root: npm run embed-plugin-settings
- *
- * Debug: console filter `[ThymerExt/PluginBackend]`. Off by default; to enable:
- *   localStorage.setItem('thymerext_debug_collections', '1'); location.reload();
- *
- * Create dedupe: Web Locks + **per-workspace** localStorage lease/recent-create keys (workspaceGuid from
- * `data.getActiveUsers()[0]`), plus abort if an exact-named Plugin Backend collection already exists.
- *
- * Rows:
- * - **Vault** (`record_kind` = `vault`): one per `plugin_id` — holds synced localStorage payload JSON.
- * - **Other rows** (`record_kind` = `log`, `config`, …): same **Plugin** field (`plugin`) for filtering;
- *   use a **distinct** `plugin_id` per row (e.g. `habit-tracker:log:2026-04-24`) so vault lookup stays unambiguous.
- *
- * API: ThymerPluginSettings.init({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
- *      ThymerPluginSettings.scheduleFlush(plugin, mirrorKeys)
- *      ThymerPluginSettings.flushNow(data, pluginId, mirrorKeys)
- *      ThymerPluginSettings.openStorageDialog({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
- *      ThymerPluginSettings.listRows(data, { pluginSlug, recordKind? })
- *      ThymerPluginSettings.createDataRow(data, { pluginSlug, recordKind, rowPluginId, recordTitle?, settingsDoc? })
- *      ThymerPluginSettings.upgradeCollectionSchema(data) — merge missing `plugin` / `record_kind` fields into existing collection
- *      ThymerPluginSettings.registerPluginSlug(data, { slug, label? }) — ensure `plugin` choice includes this slug (call once per plugin)
- */
-(function pluginSettingsRuntime(g) {
-  if (g.ThymerPluginSettings) return;
+class Plugin extends AppPlugin {
+  onLoad() {
+    this._unreg = null;
+    this._ynab = null;
 
-  const COL_NAME = 'Plugin Backend';
-  const COL_NAME_LEGACY = 'Plugin Settings';
-  const KIND_VAULT = 'vault';
-  const FIELD_PLUGIN = 'plugin';
-  const FIELD_KIND = 'record_kind';
-  const q = [];
-  let busy = false;
-
-  /**
-   * Collection ensure diagnostics (read browser console for `[ThymerExt/PluginBackend]`.
-   * Opt-in: `localStorage.setItem('thymerext_debug_collections','1')` then reload.
-   * Opt-out: remove the key or set to `0` / `off` / `false`.
-   */
-  const DEBUG_COLLECTIONS = (() => {
     try {
-      const o = localStorage.getItem('thymerext_debug_collections');
-      if (o === '0' || o === 'off' || o === 'false') return false;
-      return o === '1' || o === 'true' || o === 'on';
-    } catch (_) {}
-    return false;
-  })();
-  const DEBUG_PATHB_ID =
-    'pb-' + (Date.now() & 0xffffffff).toString(16) + '-' + Math.random().toString(36).slice(2, 7);
-
-  /** In-flight dedupe: parallel plugin `init()` calls share one `getAllCollections()` snapshot. */
-  const DATA_GET_ALL_P = '__thymerExtGetAllCollectionsInflight';
-
-  function preferDeferredHeavyWork() {
-    try {
-      if (typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches) return true;
-    } catch (_) {}
-    try {
-      return Number(navigator?.maxTouchPoints) > 0;
-    } catch (_) {}
-    return false;
-  }
-
-  const MOBILE_GRACE_UNTIL_KEY = '__thymerExtMobileGraceUntil';
-  const MOBILE_HIDDEN_AT_KEY = '__thymerExtMobileHiddenAt';
-  const MOBILE_INTERACT_THROTTLE_AT_KEY = '__thymerExtMobileInteractThrottleAt';
-  /** Mobile: pause heavy-work queue briefly so navigation stays responsive. Desktop: no grace gate. */
-  const MOBILE_GRACE_MS = 32000;
-  const MOBILE_RESUME_GRACE_MS = 20000;
-  const MOBILE_RESUME_AWAY_MS = 15000;
-  /** Interaction only pauses the heavy-work queue briefly — do not extend MOBILE_GRACE. */
-  const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 8000;
-  /** Desktop: brief heavy-work pause after first click during startup storm. */
-  const DESKTOP_HEAVY_PAUSE_ON_INTERACT_MS = 6000;
-  const MOBILE_INTERACTION_THROTTLE_MS = 2500;
-  const HEAVY_QUEUE_PAUSED_UNTIL_KEY = '__thymerExtHeavyQueuePausedUntil';
-
-  /** Cross-platform: defer vault scans / footer data populate while Thymer syncs; shells may still mount. */
-  const STARTUP_STORM_UNTIL_KEY = '__thymerExtStartupStormUntil';
-  const STARTUP_STORM_MOBILE_MS = 38000;
-  const STARTUP_STORM_DESKTOP_MS = 14000;
-
-  // Heavy work scheduler: many plugins "wake up" together after mobile grace ends.
-  // Running them concurrently causes long-task storms that block navigation.
-  const HEAVY_Q_KEY = '__thymerExtHeavyWorkQueue';
-  const HEAVY_BUSY_KEY = '__thymerExtHeavyWorkBusy';
-
-  function ensureStartupStormWindow(extraMs) {
-    const ms =
-      extraMs > 0
-        ? extraMs
-        : preferDeferredHeavyWork()
-          ? STARTUP_STORM_MOBILE_MS
-          : STARTUP_STORM_DESKTOP_MS;
-    const until = Date.now() + ms;
-    try {
-      if (!g[STARTUP_STORM_UNTIL_KEY] || g[STARTUP_STORM_UNTIL_KEY] < until) {
-        g[STARTUP_STORM_UNTIL_KEY] = until;
-      }
-    } catch (_) {}
-    installStartupStormInteractionListener();
-  }
-
-  function inStartupStormWindow() {
-    try {
-      return Date.now() < (g[STARTUP_STORM_UNTIL_KEY] || 0);
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function endStartupStormWindow() {
-    try {
-      g[STARTUP_STORM_UNTIL_KEY] = 0;
-    } catch (_) {}
-  }
-
-  function scheduleAfterStartupStorm(run, opts) {
-    if (typeof run !== 'function') return;
-    if (!inStartupStormWindow()) {
-      try {
-        run();
-      } catch (_) {}
+      this._ynab = new DawnYnab(this);
+      this._ynab.attach();
+    } catch (e) {
+      console.error('[Dawn/YNAB] engine missing — deploy concatenated bundle', e);
       return;
     }
-    const pollMs = Math.max(120, Number(opts?.pollMs) || 400);
-    const maxWaitMs = Math.max(pollMs, Number(opts?.maxWaitMs) || 120000);
-    const started = Date.now();
-    const tick = () => {
-      if (!inStartupStormWindow() || Date.now() - started >= maxWaitMs) {
-        try {
-          run();
-        } catch (_) {}
-        return;
-      }
-      setTimeout(tick, pollMs);
-    };
-    setTimeout(tick, pollMs);
-  }
 
-  function installStartupStormInteractionListener() {
-    g.__thymerExtStormOnInteract = () => {
-      try {
-        endStartupStormWindow();
-        pauseHeavyWorkQueue(
-          preferDeferredHeavyWork() ? MOBILE_HEAVY_PAUSE_ON_INTERACT_MS : DESKTOP_HEAVY_PAUSE_ON_INTERACT_MS
-        );
-      } catch (_) {}
-    };
-    if (g.__thymerExtStormInteractInstalled) return;
-    g.__thymerExtStormInteractInstalled = true;
-    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
-    const onInteract = () => {
-      try {
-        g.__thymerExtStormOnInteract?.();
-      } catch (_) {}
-    };
-    for (const ev of ['pointerdown', 'touchstart', 'keydown']) {
-      try {
-        document.addEventListener(ev, onInteract, { passive: true, capture: true });
-      } catch (_) {}
-    }
-  }
-
-  function ensureMobileLoadGraceStarted(extraMs) {
-    if (!preferDeferredHeavyWork()) return;
-    ensureStartupStormWindow();
-    const until = Date.now() + (extraMs > 0 ? extraMs : MOBILE_GRACE_MS);
-    try {
-      if (!g[MOBILE_GRACE_UNTIL_KEY] || g[MOBILE_GRACE_UNTIL_KEY] < until) {
-        g[MOBILE_GRACE_UNTIL_KEY] = until;
-      }
-    } catch (_) {}
-    installStartupStormInteractionListener();
-  }
-
-  function inMobileLoadGrace() {
-    if (!preferDeferredHeavyWork()) return false;
-    try {
-      return Date.now() < (g[MOBILE_GRACE_UNTIL_KEY] || 0);
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function bumpMobileLoadGrace(ms) {
-    if (!preferDeferredHeavyWork()) return;
-    const until = Date.now() + (ms > 0 ? ms : MOBILE_RESUME_GRACE_MS);
-    try {
-      if (!g[MOBILE_GRACE_UNTIL_KEY] || g[MOBILE_GRACE_UNTIL_KEY] < until) {
-        g[MOBILE_GRACE_UNTIL_KEY] = until;
-      }
-    } catch (_) {}
-  }
-
-  function installMobileResumeGraceListener() {
-    if (g.__thymerExtMobileGraceListenerInstalled) return;
-    g.__thymerExtMobileGraceListenerInstalled = true;
-    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
-    document.addEventListener(
-      'visibilitychange',
-      () => {
-        try {
-          if (document.visibilityState === 'hidden') {
-            g[MOBILE_HIDDEN_AT_KEY] = Date.now();
-          } else if (document.visibilityState === 'visible') {
-            const hiddenAt = g[MOBILE_HIDDEN_AT_KEY] || 0;
-            const away = hiddenAt ? Date.now() - hiddenAt : 0;
-            if (away >= MOBILE_RESUME_AWAY_MS) bumpMobileLoadGrace(MOBILE_RESUME_GRACE_MS);
-          }
-        } catch (_) {}
-      },
-      { passive: true }
-    );
-  }
-
-  function pauseHeavyWorkQueue(ms) {
-    if (!preferDeferredHeavyWork()) return;
-    const until = Date.now() + (ms > 0 ? ms : MOBILE_HEAVY_PAUSE_ON_INTERACT_MS);
-    try {
-      if (!g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] || g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] < until) {
-        g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] = until;
-      }
-    } catch (_) {}
-  }
-
-  function isHeavyWorkQueuePaused() {
-    try {
-      return Date.now() < (g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] || 0);
-    } catch (_) {
-      return false;
-    }
-  }
-
-  /**
-   * True during the brief startup window — use only to skip *background* sync scans,
-   * not user-initiated panel.navigated mounts (those should still schedule with debounce).
-   */
-  function shouldDeferPanelFooterWork() {
-    return inMobileLoadGrace();
-  }
-
-  /** Run `fn` now, or poll until mobile load grace ends (for one-shot startup scans that must not be dropped). */
-  function scheduleAfterMobileLoadGrace(run, opts) {
-    if (typeof run !== 'function') return;
-    if (!preferDeferredHeavyWork() || !inMobileLoadGrace()) {
-      try {
-        run();
-      } catch (_) {}
-      return;
-    }
-    const pollMs = Math.max(120, Number(opts?.pollMs) || 350);
-    const maxWaitMs = Math.max(pollMs, Number(opts?.maxWaitMs) || 90000);
-    const started = Date.now();
-    const tick = () => {
-      if (!inMobileLoadGrace() || Date.now() - started >= maxWaitMs) {
-        try {
-          run();
-        } catch (_) {}
-        return;
-      }
-      setTimeout(tick, pollMs);
-    };
-    setTimeout(tick, pollMs);
-  }
-
-  function installMobileInteractionGraceListener() {
-    if (g.__thymerExtMobileInteractGraceInstalled) return;
-    g.__thymerExtMobileInteractGraceInstalled = true;
-    if (!preferDeferredHeavyWork()) return;
-    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
-
-    const onInteract = () => {
-      try {
-        const now = Date.now();
-        const prev = g[MOBILE_INTERACT_THROTTLE_AT_KEY] || 0;
-        if (now - prev < MOBILE_INTERACTION_THROTTLE_MS) return;
-        g[MOBILE_INTERACT_THROTTLE_AT_KEY] = now;
-        endStartupStormWindow();
-        pauseHeavyWorkQueue(MOBILE_HEAVY_PAUSE_ON_INTERACT_MS);
-      } catch (_) {}
-    };
-
-    for (const ev of ['pointerdown', 'touchstart', 'keydown']) {
-      try {
-        document.addEventListener(ev, onInteract, { passive: true, capture: true });
-      } catch (_) {}
-    }
-  }
-
-  async function yieldToHostOneTick() {
-    await new Promise((r) => {
-      try {
-        requestAnimationFrame(() => requestAnimationFrame(() => r()));
-      } catch (_) {
-        setTimeout(r, 0);
-      }
-    });
-  }
-
-  async function runNextHeavyWork() {
-    if (g[HEAVY_BUSY_KEY]) return;
-    const q = g[HEAVY_Q_KEY];
-    if (!Array.isArray(q) || q.length === 0) return;
-    g[HEAVY_BUSY_KEY] = true;
-    try {
-      while (Array.isArray(g[HEAVY_Q_KEY]) && g[HEAVY_Q_KEY].length) {
-        if (inMobileLoadGrace() || isHeavyWorkQueuePaused()) break;
-        const job = g[HEAVY_Q_KEY].shift();
-        if (!job || typeof job.run !== 'function') continue;
-        try {
-          await yieldToHostOneTick();
-        } catch (_) {}
-        // Prefer running during idle; fallback is still serialized.
-        try {
-          if (typeof requestIdleCallback === 'function') {
-            await new Promise((resolve) => requestIdleCallback(resolve, { timeout: 1200 }));
-          }
-        } catch (_) {}
-        try {
-          await job.run();
-        } catch (_) {}
-        // Yield after each heavy job so navigation events can be processed.
-        try {
-          await yieldToHostOneTick();
-        } catch (_) {}
-      }
-    } finally {
-      g[HEAVY_BUSY_KEY] = false;
-      // If we stopped due to grace, try again later.
-      if (Array.isArray(g[HEAVY_Q_KEY]) && g[HEAVY_Q_KEY].length) {
-        setTimeout(() => runNextHeavyWork(), inMobileLoadGrace() ? 450 : 200);
-      }
-    }
-  }
-
-  function enqueueHeavyWork(run, opts) {
-    if (typeof run !== 'function') return;
-    if (!g[HEAVY_Q_KEY]) g[HEAVY_Q_KEY] = [];
-    const delayMs = Math.max(0, Number(opts?.delayMs) || 0);
-    const push = () => {
-      try {
-        g[HEAVY_Q_KEY].push({ run });
-      } catch (_) {}
-      setTimeout(() => runNextHeavyWork(), 0);
-    };
-    if (delayMs > 0) setTimeout(push, delayMs);
-    else push();
-  }
-
-  async function yieldToHostBeforePathB() {
-    await new Promise((r) => {
-      try {
-        requestAnimationFrame(() => requestAnimationFrame(() => r()));
-      } catch (_) {
-        r();
-      }
-    });
-    await new Promise((resolve) => {
-      try {
-        if (typeof requestIdleCallback === 'function') {
-          requestIdleCallback(() => resolve(), {
-            timeout: preferDeferredHeavyWork() ? 8000 : 1500,
-          });
-        } else {
-          setTimeout(resolve, preferDeferredHeavyWork() ? 48 : 16);
-        }
-      } catch (_) {
-        setTimeout(resolve, 32);
-      }
-    });
-  }
-
-  async function getAllCollectionsDeduped(data) {
-    if (!data || typeof data.getAllCollections !== 'function') return [];
-    const inflight = data[DATA_GET_ALL_P];
-    if (inflight && typeof inflight.then === 'function') {
-      try {
-        return await inflight;
-      } catch (_) {
-        // fall through to fresh fetch
-      }
-    }
-    const p = Promise.resolve()
-      .then(() => data.getAllCollections())
-      .then((all) => (Array.isArray(all) ? all : []))
-      .finally(() => {
-        try {
-          if (data[DATA_GET_ALL_P] === p) delete data[DATA_GET_ALL_P];
-        } catch (_) {}
+    this._waitForBoot((boot) => {
+      this._unreg = boot.register({
+        id: 'dawn-ynab',
+        tier: 'idle',
+        runIdle: () => this._ynab?._ynabEnsurePathBReady?.(),
+        idleDelayMs: (isMobile) => (isMobile ? 8000 : 600),
       });
-    data[DATA_GET_ALL_P] = p;
-    return p;
+    });
   }
 
-  /** If true, Thymer ignores programmatic field updates — force off on every schema save. */
-  const MANAGED_UNLOCK = { fields: false, views: false, sidebar: false };
-
-  /**
-   * Ensure Plugin Backend collection without duplicate `createCollection` calls.
-   * Sibling **plugin iframes** are often not `window` siblings — walking `parent` can stop at
-   * each plugin’s *own* frame, so a promise on “hierarchy best” is **not** one shared object.
-   * **`window.top` is the same** for all same-tab iframes and, when not cross-origin, is the
-   * one place to attach a cross-iframe lock. Fallback: walk the parent chain for opaque frames.
-   */
-  function getSharedDeduplicationWindow() {
+  onUnload() {
     try {
-      if (typeof window === 'undefined') return g;
-      const t = window.top;
-      if (t) {
-        void t.document;
-        return t;
-      }
-    } catch (_) {
-      /* cross-origin top */
-    }
-    try {
-      let w = typeof window !== 'undefined' ? window : null;
-      let best = w || g;
-      while (w) {
-        try {
-          void w.document;
-          best = w;
-        } catch (_) {
-          break;
-        }
-        if (w === w.top) break;
-        w = w.parent;
-      }
-      return best;
-    } catch (_) {
-      return typeof window !== 'undefined' ? window : g;
-    }
-  }
-
-  const PB_ENSURE_GLOBAL_P = '__thymerPluginBackendEnsureGlobalP';
-  const SERIAL_DATA_CREATE_P = '__thymerExtSerializedDataCreateP_v1';
-  /** `getAllCollections` can briefly return [] (host UI / race) after a valid non-empty read — refuse create in that window. */
-  const GETALL_COLLECTIONS_SANITY = '__thymerExtGetAllCollectionsSanityV1';
-  function touchGetAllSanityFromCount(len) {
-    const n = Number(len) || 0;
-    const h = getSharedDeduplicationWindow();
-    if (!h[GETALL_COLLECTIONS_SANITY]) h[GETALL_COLLECTIONS_SANITY] = { nLast: 0, tLast: 0 };
-    const s = h[GETALL_COLLECTIONS_SANITY];
-    if (n > 0) {
-      s.nLast = n;
-      s.tLast = Date.now();
-    }
-  }
-  function isSuspiciousEmptyAfterRecentNonEmptyList(currentLen) {
-    const c = Number(currentLen) || 0;
-    if (c > 0) {
-      touchGetAllSanityFromCount(c);
-      return false;
-    }
-    const h = getSharedDeduplicationWindow();
-    const s = h[GETALL_COLLECTIONS_SANITY];
-    if (!s || s.nLast <= 0 || !s.tLast) return false;
-    return Date.now() - s.tLast < 60_000;
-  }
-
-  function chainPluginBackendEnsure(data, work) {
-    const root = getSharedDeduplicationWindow();
-    try {
-      if (!root[PB_ENSURE_GLOBAL_P]) root[PB_ENSURE_GLOBAL_P] = Promise.resolve();
-    } catch (_) {
-      return Promise.resolve().then(work);
-    }
-    root[PB_ENSURE_GLOBAL_P] = root[PB_ENSURE_GLOBAL_P].catch(() => {}).then(work);
-    return root[PB_ENSURE_GLOBAL_P];
-  }
-
-  function withUnlockedManaged(base) {
-    return { ...(base && typeof base === 'object' ? base : {}), managed: MANAGED_UNLOCK };
-  }
-
-  /** Index of the “Plugin” column (`id` **plugin**, or legacy label match). */
-  function findPluginColumnFieldIndex(fields) {
-    const arr = Array.isArray(fields) ? fields : [];
-    let i = arr.findIndex((f) => f && f.id === FIELD_PLUGIN);
-    if (i >= 0) return i;
-    i = arr.findIndex(
-      (f) =>
-        f &&
-        String(f.label || '')
-          .trim()
-          .toLowerCase() === 'plugin' &&
-        (f.type === 'text' || f.type === 'plaintext' || f.type === 'string')
-    );
-    return i;
-  }
-
-  /** Keep internal column identity when replacing field shape (text → choice). */
-  function copyStableFieldKeys(prev, next) {
-    if (!prev || !next || typeof prev !== 'object' || typeof next !== 'object') return;
-    for (const k of ['guid', 'colguid', 'colGuid', 'field_guid']) {
-      if (prev[k] != null && next[k] == null) next[k] = prev[k];
-    }
-  }
-
-  function getPluginFieldDef(coll) {
-    if (!coll || typeof coll.getConfiguration !== 'function') return null;
-    try {
-      const fields = coll.getConfiguration()?.fields || [];
-      const i = findPluginColumnFieldIndex(fields);
-      return i >= 0 ? fields[i] : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function pluginColumnPropId(coll, requestedId) {
-    if (requestedId !== FIELD_PLUGIN || !coll) return requestedId;
-    const f = getPluginFieldDef(coll);
-    return (f && f.id) || FIELD_PLUGIN;
-  }
-
-  function cloneFieldDef(f) {
-    if (!f || typeof f !== 'object') return f;
-    try {
-      return structuredClone(f);
-    } catch (_) {
-      try {
-        return JSON.parse(JSON.stringify(f));
-      } catch (__) {
-        return { ...f };
-      }
-    }
-  }
-
-  const PLUGIN_SETTINGS_SHAPE = {
-    ver: 1,
-    name: COL_NAME,
-    icon: 'ti-adjustments',
-    color: null,
-    home: false,
-    page_field_ids: [FIELD_PLUGIN, FIELD_KIND, 'plugin_id', 'created_at', 'updated_at', 'settings_json'],
-    item_name: 'Setting, Config, or Log',
-    description: 'Workspace storage for plugins: Use the Plugin column to filter by plugin.',
-    show_sidebar_items: true,
-    show_cmdpal_items: false,
-    fields: [
-      {
-        icon: 'ti-apps',
-        id: FIELD_PLUGIN,
-        label: 'Plugin',
-        type: 'choice',
-        read_only: false,
-        active: true,
-        many: false,
-        choices: [
-          { id: 'quick-notes', label: 'quick-notes', color: '0', active: true },
-          { id: 'habit-tracker', label: 'Habit Tracker', color: '0', active: true },
-          { id: 'ynab', label: 'ynab', color: '0', active: true },
-        ],
-      },
-      {
-        icon: 'ti-category',
-        id: FIELD_KIND,
-        label: 'Record kind',
-        type: 'text',
-        read_only: false,
-        active: true,
-        many: false,
-      },
-      {
-        icon: 'ti-id',
-        id: 'plugin_id',
-        label: 'Plugin ID',
-        type: 'text',
-        read_only: false,
-        active: true,
-        many: false,
-      },
-      {
-        icon: 'ti-clock-plus',
-        id: 'created_at',
-        label: 'Created',
-        many: false,
-        read_only: true,
-        active: true,
-        type: 'datetime',
-      },
-      {
-        icon: 'ti-clock-edit',
-        id: 'updated_at',
-        label: 'Modified',
-        many: false,
-        read_only: true,
-        active: true,
-        type: 'datetime',
-      },
-      {
-        icon: 'ti-code',
-        id: 'settings_json',
-        label: 'Settings JSON',
-        type: 'text',
-        read_only: false,
-        active: true,
-        many: false,
-      },
-      {
-        icon: 'ti-abc',
-        id: 'title',
-        label: 'Title',
-        many: false,
-        read_only: false,
-        active: true,
-        type: 'text',
-      },
-      {
-        icon: 'ti-photo',
-        id: 'banner',
-        label: 'Banner',
-        many: false,
-        read_only: false,
-        active: true,
-        type: 'banner',
-      },
-      {
-        icon: 'ti-align-left',
-        id: 'icon',
-        label: 'Icon',
-        many: false,
-        read_only: false,
-        active: true,
-        type: 'text',
-      },
-    ],
-    sidebar_record_sort_dir: 'desc',
-    sidebar_record_sort_field_id: 'updated_at',
-    managed: { fields: false, views: false, sidebar: false },
-    custom: {},
-    views: [
-      {
-        id: 'V0YBPGDDZ0MHRSQ',
-        shown: true,
-        icon: 'ti-table',
-        label: 'All',
-        description: '',
-        field_ids: ['title', FIELD_PLUGIN, FIELD_KIND, 'plugin_id', 'created_at', 'updated_at'],
-        type: 'table',
-        read_only: false,
-        group_by_field_id: null,
-        sort_dir: 'desc',
-        sort_field_id: 'updated_at',
-        opts: {},
-      },
-      {
-        id: 'VPGAWVGVKZD57C9',
-        shown: true,
-        icon: 'ti-layout-kanban',
-        label: 'By Plugin...',
-        description: '',
-        field_ids: ['title', FIELD_KIND, 'created_at', 'updated_at'],
-        type: 'board',
-        read_only: false,
-        group_by_field_id: FIELD_PLUGIN,
-        sort_dir: 'desc',
-        sort_field_id: 'updated_at',
-        opts: {},
-      },
-    ],
-  };
-
-  function cloneShape() {
-    try {
-      return structuredClone(PLUGIN_SETTINGS_SHAPE);
-    } catch (_) {
-      return JSON.parse(JSON.stringify(PLUGIN_SETTINGS_SHAPE));
-    }
-  }
-
-  /** Append default views from the canonical shape when the workspace collection is missing them (by view `id`). */
-  function mergeViewsArray(baseViews, desiredViews) {
-    const desired = Array.isArray(desiredViews) ? desiredViews.map((v) => cloneFieldDef(v)) : [];
-    const cur = Array.isArray(baseViews) ? baseViews.map((v) => cloneFieldDef(v)) : [];
-    if (cur.length === 0) {
-      return { views: desired, changed: desired.length > 0 };
-    }
-    const ids = new Set(cur.map((v) => v && v.id).filter(Boolean));
-    let changed = false;
-    for (const v of desired) {
-      if (v && v.id && !ids.has(v.id)) {
-        cur.push(cloneFieldDef(v));
-        ids.add(v.id);
-        changed = true;
-      }
-    }
-    return { views: cur, changed };
-  }
-
-  /** Slug before first colon, else whole id (e.g. `habit-tracker:log:2026-04-24` → `habit-tracker`). */
-  function inferPluginSlugFromPid(pid) {
-    if (!pid) return '';
-    const s = String(pid).trim();
-    const i = s.indexOf(':');
-    if (i <= 0) return s;
-    return s.slice(0, i);
-  }
-
-  function inferRecordKindFromPid(pid, slug) {
-    if (!pid || !slug) return '';
-    const p = String(pid);
-    if (p === slug) return KIND_VAULT;
-    if (p === `${slug}:config`) return 'config';
-    if (p.startsWith(`${slug}:log:`)) return 'log';
-    return '';
-  }
-
-  function colorForSlug(slug) {
-    const colors = ['0', '1', '2', '3', '4', '5', '6', '7'];
-    let h = 0;
-    const s = String(slug || '');
-    for (let i = 0; i < s.length; i++) h = (h + s.charCodeAt(i) * (i + 1)) % colors.length;
-    return colors[h];
-  }
-
-  /** Normalize Thymer choice option (object or legacy string). */
-  function normalizeChoiceOption(c) {
-    if (c == null) return null;
-    if (typeof c === 'string') {
-      const s = c.trim();
-      if (!s) return null;
-      return { id: s, label: s, color: colorForSlug(s), active: true };
-    }
-    const id = String(c.id ?? c.label ?? '')
-      .trim();
-    if (!id) return null;
-    return {
-      id,
-      label: String(c.label ?? id).trim() || id,
-      color: String(c.color != null ? c.color : colorForSlug(id)),
-      active: c.active !== false,
-    };
-  }
-
-  /**
-   * Fresh choice field object (no legacy keys). Thymer often ignores `type` changes when merging
-   * onto an existing text field’s full config — same pattern as markdown importer choice fields.
-   */
-  function cleanPluginChoiceField(prev, desiredPlugin, choicesList) {
-    const fieldId = (prev && prev.id) || FIELD_PLUGIN;
-    const next = {
-      id: fieldId,
-      label: (prev && prev.label) || desiredPlugin.label || 'Plugin',
-      icon: (prev && prev.icon) || desiredPlugin.icon || 'ti-apps',
-      type: 'choice',
-      many: false,
-      read_only: false,
-      active: prev ? prev.active !== false : true,
-      choices: Array.isArray(choicesList) ? choicesList : [],
-    };
-    copyStableFieldKeys(prev, next);
-    return next;
-  }
-
-  /**
-   * Ensure the `plugin` field is a choice field and its options cover every slug
-   * already present on rows (migrates legacy `type: 'text'` definitions).
-   */
-  async function reconcilePluginFieldAsChoice(coll, curFields, desired) {
-    const desiredPlugin = desired.fields.find((f) => f && f.id === FIELD_PLUGIN);
-    if (!desiredPlugin) return { fields: curFields, changed: false };
-
-    const idx = findPluginColumnFieldIndex(curFields);
-    const prev = idx >= 0 ? curFields[idx] : null;
-
-    const choices = [];
-    const seen = new Set();
-    const pushOpt = (opt) => {
-      const n = normalizeChoiceOption(opt);
-      if (!n || seen.has(n.id)) return;
-      seen.add(n.id);
-      choices.push(n);
-    };
-
-    if (prev && prev.type === 'choice' && Array.isArray(prev.choices)) {
-      for (const c of prev.choices) pushOpt(c);
-    }
-
-    let records = [];
-    try {
-      records = await coll.getAllRecords();
-    } catch (_) {}
-
-    const plugCol = pluginColumnPropId(coll, FIELD_PLUGIN);
-    const slugSet = new Set();
-    for (const r of records) {
-      const a = rowField(r, plugCol);
-      if (a) slugSet.add(a.trim());
-      const inf = inferPluginSlugFromPid(rowField(r, 'plugin_id'));
-      if (inf) slugSet.add(inf);
-    }
-    for (const slug of [...slugSet].sort()) {
-      if (!slug) continue;
-      pushOpt({ id: slug, label: slug, color: colorForSlug(slug), active: true });
-    }
-
-    const useClean = !prev || prev.type !== 'choice';
-    const nextPluginField = useClean
-      ? cleanPluginChoiceField(prev, desiredPlugin, choices)
-      : (() => {
-          const merged = {
-            ...desiredPlugin,
-            type: 'choice',
-            choices,
-            icon: (prev && prev.icon) || desiredPlugin.icon,
-            label: (prev && prev.label) || desiredPlugin.label,
-            id: (prev && prev.id) || desiredPlugin.id || FIELD_PLUGIN,
-          };
-          copyStableFieldKeys(prev, merged);
-          return merged;
-        })();
-
-    let changed = false;
-    if (idx < 0) {
-      curFields.push(nextPluginField);
-      changed = true;
-    } else if (JSON.stringify(prev) !== JSON.stringify(nextPluginField)) {
-      curFields[idx] = nextPluginField;
-      changed = true;
-    }
-
-    return { fields: curFields, changed };
-  }
-
-  async function registerPluginSlug(data, { slug, label } = {}) {
-    const id = (slug || '').trim();
-    if (!id || !data) return;
-    await ensurePluginSettingsCollection(data);
-    const coll = await findColl(data);
-    if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') return;
-    await upgradePluginSettingsSchema(data, coll);
-    let slugRegisterSavedOk = false;
-    try {
-      const base = coll.getConfiguration() || {};
-      const fields = Array.isArray(base.fields) ? [...base.fields] : [];
-      const idx = findPluginColumnFieldIndex(fields);
-      if (idx < 0) {
-        await rewritePluginChoiceCells(coll);
-        return;
-      }
-      const prev = fields[idx];
-      if (prev.type !== 'choice') {
-        await rewritePluginChoiceCells(coll);
-        return;
-      }
-      const prevChoices = Array.isArray(prev.choices) ? prev.choices : [];
-      const normalized = prevChoices.map((c) => normalizeChoiceOption(c)).filter(Boolean);
-      const byId = new Map(normalized.map((c) => [c.id, c]));
-      const existing = byId.get(id);
-      if (existing) {
-        if (label && String(existing.label) !== String(label)) {
-          byId.set(id, { ...existing, label: String(label) });
-        } else {
-          await rewritePluginChoiceCells(coll);
-          return;
-        }
-      } else {
-        byId.set(id, { id, label: label || id, color: colorForSlug(id), active: true });
-      }
-      const prevOrder = normalized.map((c) => c.id);
-      const out = [];
-      const used = new Set();
-      for (const pid of prevOrder) {
-        if (byId.has(pid) && !used.has(pid)) {
-          out.push(byId.get(pid));
-          used.add(pid);
-        }
-      }
-      for (const [pid, opt] of byId) {
-        if (!used.has(pid)) {
-          out.push(opt);
-          used.add(pid);
-        }
-      }
-      const next = { ...prev, type: 'choice', choices: out };
-      if (JSON.stringify(prev) !== JSON.stringify(next)) {
-        fields[idx] = next;
-        const ok = await coll.saveConfiguration(withUnlockedManaged({ ...base, fields }));
-        if (ok === false) console.warn('[ThymerPluginSettings] registerPluginSlug: saveConfiguration returned false');
-        else slugRegisterSavedOk = true;
-      }
-    } catch (e) {
-      console.error('[ThymerPluginSettings] registerPluginSlug', e);
-    }
-    if (slugRegisterSavedOk) await rewritePluginChoiceCells(coll);
-  }
-
-  /**
-   * Merge missing field definitions into the Plugin Backend collection
-   * (e.g. after Thymer auto-created a minimal schema, or older two-field configs).
-   */
-  async function upgradePluginSettingsSchema(data, collOpt) {
-    await ensurePluginSettingsCollection(data);
-    const coll = collOpt || (await findColl(data));
-    if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') return;
-    try {
-      let base = coll.getConfiguration() || {};
-      try {
-        if (typeof coll.getExistingCodeAndConfig === 'function') {
-          const pack = coll.getExistingCodeAndConfig();
-          if (pack && pack.json && typeof pack.json === 'object') {
-            base = { ...base, ...pack.json };
-          }
-        }
-      } catch (_) {}
-      const desired = cloneShape();
-      const curFields = Array.isArray(base.fields) ? base.fields.map((f) => cloneFieldDef(f)) : [];
-      const curIds = new Set(curFields.map((f) => (f && f.id ? f.id : null)).filter(Boolean));
-      let changed = false;
-      for (const f of desired.fields) {
-        if (!f || !f.id || curIds.has(f.id)) continue;
-        if (f.id === FIELD_PLUGIN && findPluginColumnFieldIndex(curFields) >= 0) continue;
-        curFields.push(cloneFieldDef(f));
-        curIds.add(f.id);
-        changed = true;
-      }
-      const rec = await reconcilePluginFieldAsChoice(coll, curFields, desired);
-      if (rec.changed) changed = true;
-      const finalFields = rec.fields;
-
-      const vMerge = mergeViewsArray(base.views, desired.views);
-      if (vMerge.changed) changed = true;
-      const finalViews = vMerge.views;
-
-      const curPages = [...(base.page_field_ids || [])];
-      const wantPages = [...(desired.page_field_ids || [])];
-      const mergedPages = [...new Set([...wantPages, ...curPages])];
-      if (JSON.stringify(curPages) !== JSON.stringify(mergedPages)) changed = true;
-      if ((base.description || '') !== desired.description) changed = true;
-      if ((base.item_name || '') !== (desired.item_name || '')) changed = true;
-      if (String(base.name || '').trim() !== COL_NAME) changed = true;
-      if (changed) {
-        const merged = withUnlockedManaged({
-          ...base,
-          name: COL_NAME,
-          description: desired.description,
-          fields: finalFields,
-          page_field_ids: mergedPages.length ? mergedPages : wantPages,
-          item_name: desired.item_name || base.item_name,
-          icon: desired.icon || base.icon,
-          color: desired.color !== undefined ? desired.color : base.color,
-          home: desired.home !== undefined ? desired.home : base.home,
-          views: finalViews,
-          sidebar_record_sort_field_id: desired.sidebar_record_sort_field_id || base.sidebar_record_sort_field_id,
-          sidebar_record_sort_dir: desired.sidebar_record_sort_dir || base.sidebar_record_sort_dir,
-        });
-        const ok = await coll.saveConfiguration(merged);
-        if (ok === false) console.warn('[ThymerPluginSettings] saveConfiguration returned false (schema not applied?)');
-        else {
-          try {
-            const pf = getPluginFieldDef(coll);
-            if (pf && pf.type !== 'choice') {
-              console.error(
-                '[ThymerPluginSettings] saveConfiguration succeeded but "plugin" field is still type',
-                pf.type,
-                '— check collection General tab or re-import plugins/public repo/plugin-settings/Plugin Backend.json.'
-              );
-            }
-          } catch (_) {}
-        }
-      }
-      if (changed) await rewritePluginChoiceCells(coll);
-    } catch (e) {
-      console.error('[ThymerPluginSettings] upgrade schema', e);
-    }
-  }
-
-  /** Re-apply `plugin` via setChoice so rows are not stuck as “(Other)” after text→choice migration. */
-  async function rewritePluginChoiceCells(coll) {
-    if (!coll || typeof coll.getAllRecords !== 'function') return;
-    try {
-      const pluginField = getPluginFieldDef(coll);
-      if (!pluginField || pluginField.type !== 'choice') return;
-    } catch (_) {
-      return;
-    }
-    let records = [];
-    try {
-      records = await coll.getAllRecords();
-    } catch (_) {
-      return;
-    }
-    for (const r of records) {
-      let slug = inferPluginSlugFromPid(rowField(r, 'plugin_id'));
-      if (!slug) slug = rowField(r, pluginColumnPropId(coll, FIELD_PLUGIN));
-      if (!slug) continue;
-      setRowField(r, FIELD_PLUGIN, slug, coll);
-      // Rows written while setRowField wrongly skipped p.set() for plugin_id (setChoice branch).
-      const pidNow = rowField(r, 'plugin_id').trim();
-      if (!pidNow) {
-        const kind = (rowField(r, FIELD_KIND) || '').trim();
-        let legacyVault = false;
-        if (!kind) {
-          try {
-            const raw = rowField(r, 'settings_json');
-            if (raw && String(raw).includes('"storageMode"')) legacyVault = true;
-          } catch (_) {}
-        }
-        if (kind === KIND_VAULT || legacyVault) {
-          setRowField(r, 'plugin_id', slug, coll);
-        } else if (kind === 'config') {
-          setRowField(r, 'plugin_id', `${slug}:config`, coll);
-        } else if (kind === 'log') {
-          let ds = '';
-          try {
-            const raw = rowField(r, 'settings_json');
-            if (raw) {
-              const j = JSON.parse(raw);
-              if (j && j.date) ds = String(j.date).trim();
-            }
-          } catch (_) {}
-          if (!/^\d{4}-\d{2}-\d{2}$/.test(ds) && typeof r.getName === 'function') {
-            ds = String(r.getName() || '').trim();
-          }
-          if (/^\d{4}-\d{2}-\d{2}$/.test(ds)) {
-            setRowField(r, 'plugin_id', `${slug}:log:${ds}`, coll);
-          }
-        }
-      }
-    }
-  }
-
-  function rowField(r, id) {
-    if (!r) return '';
-    try {
-      const p = r.prop?.(id);
-      if (p && typeof p.choice === 'function') {
-        const c = p.choice();
-        if (c != null && String(c).trim() !== '') return String(c).trim();
-      }
-    } catch (_) {}
-    let v = '';
-    try {
-      v = r.text?.(id);
-    } catch (_) {}
-    if (v != null && String(v).trim() !== '') return String(v).trim();
-    try {
-      const p = r.prop?.(id);
-      if (p && typeof p.get === 'function') {
-        const g = p.get();
-        return g == null ? '' : String(g).trim();
-      }
-      if (p && typeof p.text === 'function') {
-        const t = p.text();
-        return t == null ? '' : String(t).trim();
-      }
-    } catch (_) {}
-    return '';
-  }
-
-  /** Thymer `setChoice` matches option **label** (see YNAB plugins); return label for slug `id`, else slug. */
-  function pluginChoiceSetName(coll, slug) {
-    const s = String(slug || '').trim();
-    if (!s || !coll || typeof coll.getConfiguration !== 'function') return s;
-    try {
-      const f = getPluginFieldDef(coll);
-      if (!f || f.type !== 'choice' || !Array.isArray(f.choices)) return s;
-      const opt = f.choices.find((c) => c && String(c.id || '').trim() === s);
-      if (opt && opt.label != null && String(opt.label).trim() !== '') return String(opt.label).trim();
-    } catch (_) {}
-    return s;
-  }
-
-  /**
-   * @param coll Optional collection — pass when writing `plugin` so setChoice uses the correct option **label**.
-   */
-  function setRowField(r, id, value, coll = null) {
-    if (!r) return;
-    const raw = value == null ? '' : String(value);
-    const s = raw.trim();
-    const propId = pluginColumnPropId(coll, id);
-    try {
-      const p = r.prop?.(propId);
-      if (!p) return;
-      // Thymer exposes setChoice on many property types; it returns false for non-choice fields.
-      // Only use setChoice for the Plugin **slug** column — otherwise we return early and never p.set().
-      const isPluginChoiceCol = id === FIELD_PLUGIN;
-      if (isPluginChoiceCol && typeof p.setChoice === 'function') {
-        if (!s) {
-          if (typeof p.set === 'function') p.set('');
-          return;
-        }
-        const nameTry = coll != null ? pluginChoiceSetName(coll, s) : s;
-        if (p.setChoice(nameTry)) return;
-        if (nameTry !== s && p.setChoice(s)) return;
-        if (typeof p.set === 'function') {
-          try {
-            p.set(s);
-            return;
-          } catch (_) {
-            /* continue to warn */
-          }
-        }
-        console.warn('[ThymerPluginSettings] setChoice: no option matched field', id, 'slug', s, 'tried', nameTry);
-        return;
-      }
-      if (typeof p.set === 'function') p.set(raw);
-    } catch (e) {
-      console.warn('[ThymerPluginSettings] setRowField', id, e);
-    }
-  }
-
-  /** True for the single mirror row per logical plugin (plugin_id === pluginId and kind vault or legacy). */
-  function isVaultRow(r, pluginId) {
-    const pid = rowField(r, 'plugin_id');
-    if (pid !== pluginId) return false;
-    const kind = rowField(r, FIELD_KIND);
-    if (kind === KIND_VAULT) return true;
-    if (!kind) return true;
-    return false;
-  }
-
-  /** Parse ISO-ish timestamps for vault row scoring (duplicates: pick freshest, not first in list). */
-  function parseVaultIsoMs(s) {
-    const n = Date.parse(String(s || ''));
-    return Number.isFinite(n) ? n : 0;
-  }
-
-  function vaultRowFreshnessScore(r) {
-    let score = 0;
-    let raw = '';
-    try {
-      raw = rowField(r, 'settings_json');
-    } catch (_) {}
-    if (raw && String(raw).trim()) {
-      try {
-        const j = JSON.parse(raw);
-        if (j && typeof j.updatedAt === 'string') {
-          const ms = parseVaultIsoMs(j.updatedAt);
-          if (ms > score) score = ms;
-        }
-      } catch (_) {}
-    }
-    try {
-      const ua = rowField(r, 'updated_at');
-      if (ua) {
-        const ms = parseVaultIsoMs(ua);
-        if (ms > score) score = ms;
-      }
-    } catch (_) {}
-    return score;
-  }
-
-  function settingsJsonPayloadLen(r) {
-    try {
-      return String(rowField(r, 'settings_json') || '').length;
-    } catch (_) {
-      return 0;
-    }
-  }
-
-  /**
-   * Prefer the **newest** vault row when duplicates exist (same `plugin_id`, multiple vault-shaped rows).
-   * Previously the first list match could be stale while a newer row held the real payload.
-   */
-  function findVaultRecord(records, pluginId) {
-    if (!records) return null;
-    let best = null;
-    let bestScore = -1;
-    for (const x of records) {
-      if (!isVaultRow(x, pluginId)) continue;
-      const sc = vaultRowFreshnessScore(x);
-      if (sc > bestScore) {
-        bestScore = sc;
-        best = x;
-      } else if (sc === bestScore && best) {
-        const lenX = settingsJsonPayloadLen(x);
-        const lenB = settingsJsonPayloadLen(best);
-        if (lenX > lenB) best = x;
-      }
-    }
-    return best;
-  }
-
-  function applyVaultRowMeta(r, pluginId, coll) {
-    setRowField(r, 'plugin_id', pluginId);
-    setRowField(r, FIELD_PLUGIN, pluginId, coll);
-    setRowField(r, FIELD_KIND, KIND_VAULT);
-  }
-
-  function drain() {
-    if (busy || !q.length) return;
-    busy = true;
-    const job = q.shift();
-    Promise.resolve(typeof job === 'function' ? job() : job)
-      .catch((e) => console.error('[ThymerPluginSettings]', e))
-      .finally(() => {
-        busy = false;
-        if (q.length) setTimeout(drain, 450);
-      });
-  }
-
-  function enqueue(job) {
-    q.push(job);
-    drain();
-  }
-
-  /** Sidebar / command palette title may be `getName()` or only `getConfiguration().name`. */
-  function collectionDisplayName(c) {
-    if (!c) return '';
-    let s = '';
-    try {
-      s = String(c.getName?.() || '').trim();
-    } catch (_) {}
-    if (s) return s;
-    try {
-      s = String(c.getConfiguration?.()?.name || '').trim();
-    } catch (_) {}
-    return s;
-  }
-
-  /** Configured collection name only (avoids duplicating `collectionDisplayName` fallbacks). */
-  function collectionBackendConfiguredTitle(c) {
-    if (!c) return '';
-    try {
-      return String(c.getConfiguration?.()?.name || '').trim();
-    } catch (_) {
-      return '';
-    }
-  }
-
-  /**
-   * When plugin iframes are opaque (blob/sandbox), `navigator.locks` and `window.top` globals do not
-   * dedupe across realms. First `localStorage` we can reach on the Thymer app origin is shared.
-   */
-  function getSharedThymerLocalStorage() {
-    const seen = new Set();
-    const tryWin = (w) => {
-      if (!w || seen.has(w)) return null;
-      seen.add(w);
-      try {
-        const ls = w.localStorage;
-        void ls.length;
-        return ls;
-      } catch (_) {
-        return null;
-      }
-    };
-    try {
-      const t = tryWin(window.top);
-      if (t) return t;
+      this._ynab?.detach?.();
     } catch (_) {}
     try {
-      const t = tryWin(window);
-      if (t) return t;
+      this._unreg?.();
     } catch (_) {}
-    try {
-      let w = window;
-      for (let i = 0; i < 10 && w; i++) {
-        const t = tryWin(w);
-        if (t) return t;
-        if (w === w.parent) break;
-        w = w.parent;
-      }
-    } catch (_) {}
-    return null;
   }
 
-  /** Unscoped keys (legacy); runtime uses {@link scopedPbLsKey} per workspace. */
-  const LS_CREATE_LEASE_BASE = 'thymerext_plugin_backend_create_lease_v1';
-  const LS_RECENT_CREATE_BASE = 'thymerext_plugin_backend_recent_create_v1';
-  const LS_RECENT_CREATE_ATTEMPT_BASE = 'thymerext_plugin_backend_recent_create_attempt_v1';
-
-  function workspaceSlugFromData(data) {
-    try {
-      const u = data && typeof data.getActiveUsers === 'function' ? data.getActiveUsers() : null;
-      const g = u && u[0] && u[0].workspaceGuid;
-      const s = g != null ? String(g).trim() : '';
-      if (s) return s.replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 120);
-    } catch (_) {}
-    return '_unknown_ws';
-  }
-
-  function scopedPbLsKey(base, data) {
-    return `${base}__${workspaceSlugFromData(data)}`;
-  }
-
-  /** Count collections whose sidebar/title name is exactly Plugin Backend (or legacy). */
-  async function countExactPluginBackendNamedCollections(data) {
-    let all;
-    try {
-      all = await getAllCollectionsDeduped(data);
-    } catch (_) {
-      return 0;
-    }
-    if (!Array.isArray(all)) return 0;
+  _waitForBoot(cb) {
     let n = 0;
-    for (const c of all) {
-      try {
-        const nm = collectionDisplayName(c);
-        if (nm === COL_NAME || nm === COL_NAME_LEGACY) n += 1;
-      } catch (_) {}
-    }
-    return n;
-  }
-
-  /**
-   * Cross-realm mutex for `createCollection` + first `saveConfiguration` only.
-   * Lease keys are **per workspace** so switching workspaces does not inherit another vault’s lease / cooldown.
-   * @returns {{ denied: boolean, release: () => void }}
-   */
-  async function acquirePluginBackendCreationLease(maxWaitMs, data) {
-    const locksOk =
-      typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function';
-    const noop = { denied: false, release() {} };
-    const ls = getSharedThymerLocalStorage();
-    if (!ls) {
-      if (locksOk) return noop;
-      if (DEBUG_COLLECTIONS) {
-        dlogPathB('lease_denied_no_localstorage_no_locks', { ws: workspaceSlugFromData(data) });
+    const tick = () => {
+      const boot = globalThis.BootKernel || globalThis.__dawnBoot;
+      if (boot?.register) {
+        cb(boot);
+        return;
       }
-      return { denied: true, release() {} };
-    }
-    const leaseKey = scopedPbLsKey(LS_CREATE_LEASE_BASE, data);
-    const holder =
-      (typeof crypto !== 'undefined' && crypto.randomUUID && crypto.randomUUID()) ||
-      `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-    const deadline = Date.now() + (Number(maxWaitMs) > 0 ? maxWaitMs : 12000);
-    let acquired = false;
-    let sawContention = false;
-    while (Date.now() < deadline) {
-      try {
-        const raw = ls.getItem(leaseKey);
-        let busy = false;
-        if (raw) {
-          let j = null;
-          try {
-            j = JSON.parse(raw);
-          } catch (_) {
-            j = null;
-          }
-          if (j && typeof j.exp === 'number' && j.h !== holder && j.exp > Date.now()) busy = true;
-        }
-        if (busy) {
-          sawContention = true;
-          await new Promise((r) => setTimeout(r, 40 + Math.floor(Math.random() * 70)));
-          continue;
-        }
-        const exp = Date.now() + 45000;
-        const payload = JSON.stringify({ h: holder, exp });
-        ls.setItem(leaseKey, payload);
-        await new Promise((r) => setTimeout(r, 0));
-        if (ls.getItem(leaseKey) === payload) {
-          acquired = true;
-          if (DEBUG_COLLECTIONS) dlogPathB('lease_acquired', { via: 'localStorage', sawContention, leaseKey });
-          break;
-        }
-      } catch (_) {
-        return locksOk ? noop : { denied: true, release() {} };
-      }
-      await new Promise((r) => setTimeout(r, 30 + Math.floor(Math.random() * 50)));
-    }
-    if (!acquired) {
-      if (DEBUG_COLLECTIONS) dlogPathB('lease_timeout_abort_create', { sawContention, leaseKey });
-      return { denied: true, release() {} };
-    }
-    return {
-      denied: false,
-      release() {
-        if (!acquired) return;
-        acquired = false;
-        try {
-          const cur = ls.getItem(leaseKey);
-          if (!cur) return;
-          let j = null;
-          try {
-            j = JSON.parse(cur);
-          } catch (_) {
-            return;
-          }
-          if (j && j.h === holder) ls.removeItem(leaseKey);
-        } catch (_) {}
-      },
+      n += 1;
+      if (n > 240) return;
+      setTimeout(tick, 25);
     };
+    tick();
   }
-
-  function noteRecentPluginBackendCreate(data) {
-    const ls = getSharedThymerLocalStorage();
-    if (!ls || !data) return;
-    try {
-      ls.setItem(scopedPbLsKey(LS_RECENT_CREATE_BASE, data), String(Date.now()));
-    } catch (_) {}
-  }
-
-  function getRecentPluginBackendCreateAgeMs(data) {
-    const ls = getSharedThymerLocalStorage();
-    if (!ls || !data) return null;
-    try {
-      const raw = ls.getItem(scopedPbLsKey(LS_RECENT_CREATE_BASE, data));
-      const ts = Number(raw);
-      if (!Number.isFinite(ts) || ts <= 0) return null;
-      return Date.now() - ts;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function noteRecentPluginBackendCreateAttempt(data) {
-    const ls = getSharedThymerLocalStorage();
-    if (!ls || !data) return;
-    try {
-      ls.setItem(scopedPbLsKey(LS_RECENT_CREATE_ATTEMPT_BASE, data), String(Date.now()));
-    } catch (_) {}
-  }
-
-  function getRecentPluginBackendCreateAttemptAgeMs(data) {
-    const ls = getSharedThymerLocalStorage();
-    if (!ls || !data) return null;
-    try {
-      const raw = ls.getItem(scopedPbLsKey(LS_RECENT_CREATE_ATTEMPT_BASE, data));
-      const ts = Number(raw);
-      if (!Number.isFinite(ts) || ts <= 0) return null;
-      return Date.now() - ts;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  /** When Thymer omits names on `getAllCollections()` entries, match our Path B schema. */
-  function pathBCollectionScore(c) {
-    if (!c) return 0;
-    try {
-      const conf = c.getConfiguration?.() || {};
-      const fields = Array.isArray(conf.fields) ? conf.fields : [];
-      const ids = new Set(fields.map((f) => f && f.id).filter(Boolean));
-      if (!ids.has('plugin_id') || !ids.has('settings_json')) return 0;
-      let s = 2;
-      if (ids.has(FIELD_PLUGIN)) s += 2;
-      if (ids.has(FIELD_KIND)) s += 1;
-      const nm = collectionDisplayName(c).toLowerCase();
-      if (nm && (nm.includes('plugin') && (nm.includes('backend') || nm.includes('setting')))) s += 1;
-      return s;
-    } catch (_) {
-      return 0;
-    }
-  }
-
-  function pickPathBCollectionHeuristic(all) {
-    const list = Array.isArray(all) ? all : [];
-    const cands = [];
-    let bestS = 0;
-    for (const c of list) {
-      const sc = pathBCollectionScore(c);
-      if (sc > bestS) {
-        bestS = sc;
-        cands.length = 0;
-        cands.push(c);
-      } else if (sc === bestS && sc >= 2) {
-        cands.push(c);
-      }
-    }
-    if (!cands.length) return null;
-    const named = cands.find((c) => {
-      const n = collectionDisplayName(c);
-      const cfg = collectionBackendConfiguredTitle(c);
-      return n === COL_NAME || n === COL_NAME_LEGACY || cfg === COL_NAME || cfg === COL_NAME_LEGACY;
-    });
-    return named || cands[0];
-  }
-
-  function pickCollFromAll(all) {
-    try {
-      const pick = (allIn) => {
-        const list = Array.isArray(allIn) ? allIn : [];
-        return (
-          list.find((c) => collectionDisplayName(c) === COL_NAME) ||
-          list.find((c) => collectionDisplayName(c) === COL_NAME_LEGACY) ||
-          list.find((c) => collectionBackendConfiguredTitle(c) === COL_NAME) ||
-          list.find((c) => collectionBackendConfiguredTitle(c) === COL_NAME_LEGACY) ||
-          null
-        );
-      };
-      return pick(all) || pickPathBCollectionHeuristic(all) || null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function hasPluginBackendInAll(all) {
-    if (!Array.isArray(all) || all.length === 0) return false;
-    for (const c of all) {
-      const nm = collectionDisplayName(c);
-      if (nm === COL_NAME || nm === COL_NAME_LEGACY) return true;
-      const cfg = collectionBackendConfiguredTitle(c);
-      if (cfg === COL_NAME || cfg === COL_NAME_LEGACY) return true;
-    }
-    return !!pickPathBCollectionHeuristic(all);
-  }
-
-  async function findColl(data) {
-    try {
-      const all = await getAllCollectionsDeduped(data);
-      return pickCollFromAll(all);
-    } catch (_) {
-      return null;
-    }
-  }
-
-  /** Brute list scan — catches a Backend another iframe just created if `findColl` lags. */
-  async function hasPluginBackendOnWorkspace(data) {
-    try {
-      const all = await getAllCollectionsDeduped(data);
-      return hasPluginBackendInAll(all);
-    } catch (_) {
-      return false;
-    }
-  }
-
-  const PB_LOCK_NAME = 'thymer-ext-plugin-backend-ensure-v1';
-  const DATA_ENSURE_P = '__thymerExtDataPluginBackendEnsureP';
-  /** Per-workspace: Plugin Backend already ensured — skip repeat bodies (avoids getAllCollections / lock storms). */
-  const WS_ENSURE_OK_MAP = '__thymerExtPbWorkspaceEnsureOkMap_v1';
-
-  function markWorkspacePluginBackendEnsureDone(data) {
-    try {
-      const slug = workspaceSlugFromData(data);
-      const h = getSharedDeduplicationWindow();
-      if (!h[WS_ENSURE_OK_MAP] || typeof h[WS_ENSURE_OK_MAP] !== 'object') h[WS_ENSURE_OK_MAP] = Object.create(null);
-      h[WS_ENSURE_OK_MAP][slug] = true;
-    } catch (_) {}
-  }
-
-  function isWorkspacePluginBackendEnsureDone(data) {
-    try {
-      const slug = workspaceSlugFromData(data);
-      const h = getSharedDeduplicationWindow();
-      const m = h[WS_ENSURE_OK_MAP];
-      return !!(m && m[slug]);
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function dlogPathB(phase, extra) {
-    if (!DEBUG_COLLECTIONS) return;
-    try {
-      const row = { runId: DEBUG_PATHB_ID, phase, t: (typeof performance !== 'undefined' && performance.now) ? +performance.now().toFixed(1) : 0, ...extra };
-      console.info('[ThymerExt/PluginBackend]', row);
-    } catch (_) {
-      void 0;
-    }
-  }
-
-  function pathBWindowSnapshot() {
-    const snap = { runId: DEBUG_PATHB_ID, topReadable: null, hasLocks: null };
-    try {
-      if (typeof window !== 'undefined' && window.top) {
-        void window.top.document;
-        snap.topReadable = true;
-      }
-    } catch (e) {
-      snap.topReadable = false;
-      try {
-        snap.topErr = String((e && e.name) || e) || 'top-doc-threw';
-      } catch (_) {
-        snap.topErr = 'top-doc-threw';
-      }
-    }
-    const host = getSharedDeduplicationWindow();
-    try {
-      snap.hasLocks = !!(typeof navigator !== 'undefined' && navigator.locks && navigator.locks.request);
-    } catch (_) {
-      snap.hasLocks = 'err';
-    }
-    try {
-      snap.locationHref = typeof location !== 'undefined' ? String(location.href) : '';
-    } catch (_) {
-      snap.locationHref = '';
-    }
-    try {
-      snap.hasSelf = typeof self !== 'undefined' && self === window;
-      snap.selfIsTop = typeof window !== 'undefined' && window === window.top;
-      snap.hostIsTop = host === (typeof window !== 'undefined' ? window.top : null);
-      snap.hostIsSelf = host === (typeof window !== 'undefined' ? window : null);
-      snap.hostType = (host && host.constructor && host.constructor.name) || '';
-    } catch (_) {
-      void 0;
-    }
-    try {
-      snap.gHasPbP = host && host[PB_ENSURE_GLOBAL_P] != null;
-      snap.gHasCreateQ = host && host[SERIAL_DATA_CREATE_P] != null;
-    } catch (_) {
-      void 0;
-    }
-    return snap;
-  }
-
-  function queueDataCreateOnSharedWindow(factory) {
-    const host = getSharedDeduplicationWindow();
-    if (DEBUG_COLLECTIONS) {
-      dlogPathB('queueDataCreate_enter', { ...pathBWindowSnapshot() });
-    }
-    try {
-      if (!host[SERIAL_DATA_CREATE_P] || typeof host[SERIAL_DATA_CREATE_P].then !== 'function') {
-        host[SERIAL_DATA_CREATE_P] = Promise.resolve();
-      }
-      const out = (host[SERIAL_DATA_CREATE_P] = host[SERIAL_DATA_CREATE_P].catch(() => {}).then(factory));
-      if (DEBUG_COLLECTIONS) dlogPathB('queueDataCreate_chained', { gHasCreateQ: !!host[SERIAL_DATA_CREATE_P] });
-      return out;
-    } catch (e) {
-      if (DEBUG_COLLECTIONS) dlogPathB('queueDataCreate_fallback', { err: String((e && e.message) || e) });
-      return factory();
-    }
-  }
-
-  async function runPluginBackendEnsureBody(data) {
-    if (data && isWorkspacePluginBackendEnsureDone(data)) return;
-    if (DEBUG_COLLECTIONS) {
-      dlogPathB('ensureBody_start', { pathB: pathBWindowSnapshot() });
-      try {
-        if (data && data.getAllCollections) {
-          const a = await getAllCollectionsDeduped(data);
-          const list = Array.isArray(a) ? a : [];
-          const collNames = list.map((c) => {
-            try { return String(collectionDisplayName(c) || '').trim() || '(no-name)'; } catch (__) { return '(err)'; }
-          });
-          dlogPathB('ensureBody_collections', { count: (collNames && collNames.length) || 0, names: (collNames || []).slice(0, 40) });
-          if (data && data.getAllCollections) touchGetAllSanityFromCount((collNames && collNames.length) || 0);
-          const dupExact = list.filter((c) => {
-            try {
-              const nm = collectionDisplayName(c);
-              return nm === COL_NAME || nm === COL_NAME_LEGACY;
-            } catch (__) {
-              return false;
-            }
-          });
-          if (dupExact.length > 1) {
-            dlogPathB('duplicate_plugin_backend_named_collections', {
-              count: dupExact.length,
-              guids: dupExact.map((c) => {
-                try {
-                  return c.getGuid?.() || null;
-                } catch (__) {
-                  return null;
-                }
-              }),
-              doc: 'docs/PLUGIN_BACKEND_DUPLICATE_HYGIENE.md',
-            });
-          }
-        }
-      } catch (e) {
-        dlogPathB('ensureBody_getAll_failed', { err: String((e && e.message) || e) });
-      }
-    }
-    try {
-      const markPbOk = () => markWorkspacePluginBackendEnsureDone(data);
-      let existing = null;
-      for (let attempt = 0; attempt < 4; attempt++) {
-        let allAttempt;
-        try {
-          allAttempt = await getAllCollectionsDeduped(data);
-        } catch (_) {
-          allAttempt = null;
-        }
-        if (allAttempt != null) {
-          existing = pickCollFromAll(allAttempt);
-          if (existing) {
-            markPbOk();
-            return;
-          }
-          if (hasPluginBackendInAll(allAttempt)) {
-            markPbOk();
-            return;
-          }
-        } else {
-          existing = await findColl(data);
-          if (existing) {
-            markPbOk();
-            return;
-          }
-          if (await hasPluginBackendOnWorkspace(data)) {
-            markPbOk();
-            return;
-          }
-        }
-        if (attempt < 3) await new Promise((r) => setTimeout(r, 50 + attempt * 50));
-      }
-      let allPost;
-      try {
-        allPost = await getAllCollectionsDeduped(data);
-      } catch (_) {
-        allPost = null;
-      }
-      if (allPost != null) {
-        existing = pickCollFromAll(allPost);
-        if (existing) {
-          markPbOk();
-          return;
-        }
-        if (hasPluginBackendInAll(allPost)) {
-          markPbOk();
-          return;
-        }
-      } else {
-        existing = await findColl(data);
-        if (existing) {
-          markPbOk();
-          return;
-        }
-        if (await hasPluginBackendOnWorkspace(data)) {
-          markPbOk();
-          return;
-        }
-      }
-      await new Promise((r) => setTimeout(r, 120));
-      let allAfterWait;
-      try {
-        allAfterWait = await getAllCollectionsDeduped(data);
-      } catch (_) {
-        allAfterWait = null;
-      }
-      if (allAfterWait != null) {
-        if (pickCollFromAll(allAfterWait)) {
-          markPbOk();
-          return;
-        }
-        if (hasPluginBackendInAll(allAfterWait)) {
-          markPbOk();
-          return;
-        }
-      } else {
-        if (await findColl(data)) {
-          markPbOk();
-          return;
-        }
-        if (await hasPluginBackendOnWorkspace(data)) {
-          markPbOk();
-          return;
-        }
-      }
-      let preCreateLen = 0;
-      try {
-        if (data && data.getAllCollections) {
-          const all0 = await getAllCollectionsDeduped(data);
-          preCreateLen = Array.isArray(all0) ? all0.length : 0;
-          if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
-        }
-        if (preCreateLen === 0) {
-          await new Promise((r) => setTimeout(r, 150));
-          if (data && data.getAllCollections) {
-            const all1 = await getAllCollectionsDeduped(data);
-            preCreateLen = Array.isArray(all1) ? all1.length : 0;
-            if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
-          }
-        }
-        if (preCreateLen > 0) {
-          let allPre;
-          try {
-            allPre = await getAllCollectionsDeduped(data);
-          } catch (_) {
-            allPre = null;
-          }
-          if (allPre != null) {
-            if (pickCollFromAll(allPre)) {
-              markPbOk();
-              return;
-            }
-            if (hasPluginBackendInAll(allPre)) {
-              markPbOk();
-              return;
-            }
-          } else {
-            if (await findColl(data)) {
-              markPbOk();
-              return;
-            }
-            if (await hasPluginBackendOnWorkspace(data)) {
-              markPbOk();
-              return;
-            }
-          }
-        }
-        if (isSuspiciousEmptyAfterRecentNonEmptyList(preCreateLen) && preCreateLen === 0) {
-          if (DEBUG_COLLECTIONS) {
-            try {
-              const h = getSharedDeduplicationWindow();
-              dlogPathB('refuse_create_flaky_getall_empty', { pathB: pathBWindowSnapshot(), s: h[GETALL_COLLECTIONS_SANITY] || null });
-            } catch (_) {
-              dlogPathB('refuse_create_flaky_getall_empty', { pathB: pathBWindowSnapshot() });
-            }
-          }
-          return;
-        }
-      } catch (_) {
-        void 0;
-      }
-      if (DEBUG_COLLECTIONS) dlogPathB('ensureBody_about_to_create', { pathB: pathBWindowSnapshot() });
-      const lease = await acquirePluginBackendCreationLease(14000, data);
-      if (lease.denied) return;
-      try {
-        let allLease;
-        try {
-          allLease = await getAllCollectionsDeduped(data);
-        } catch (_) {
-          allLease = null;
-        }
-        if (allLease != null) {
-          if (pickCollFromAll(allLease)) {
-            markPbOk();
-            return;
-          }
-          if (hasPluginBackendInAll(allLease)) {
-            markPbOk();
-            return;
-          }
-        } else {
-          if (await findColl(data)) {
-            markPbOk();
-            return;
-          }
-          if (await hasPluginBackendOnWorkspace(data)) {
-            markPbOk();
-            return;
-          }
-        }
-        const recentAttemptAge = getRecentPluginBackendCreateAttemptAgeMs(data);
-        if (recentAttemptAge != null && recentAttemptAge >= 0 && recentAttemptAge < 120000) {
-          // Another plugin iframe attempted creation very recently. Avoid burst duplicate creates.
-          for (let i = 0; i < 10; i++) {
-            await new Promise((r) => setTimeout(r, 130 + i * 70));
-            let allCont;
-            try {
-              allCont = await getAllCollectionsDeduped(data);
-            } catch (_) {
-              allCont = null;
-            }
-            if (allCont != null) {
-              if (pickCollFromAll(allCont)) {
-                markPbOk();
-                return;
-              }
-              if (hasPluginBackendInAll(allCont)) {
-                markPbOk();
-                return;
-              }
-            } else {
-              if (await findColl(data)) {
-                markPbOk();
-                return;
-              }
-              if (await hasPluginBackendOnWorkspace(data)) {
-                markPbOk();
-                return;
-              }
-            }
-          }
-          return;
-        }
-        const recentAge = getRecentPluginBackendCreateAgeMs(data);
-        if (recentAge != null && recentAge >= 0 && recentAge < 90000) {
-          // Another plugin/runtime likely just created it; let collection list/indexing settle first.
-          for (let i = 0; i < 8; i++) {
-            await new Promise((r) => setTimeout(r, 120 + i * 60));
-            let allSettle;
-            try {
-              allSettle = await getAllCollectionsDeduped(data);
-            } catch (_) {
-              allSettle = null;
-            }
-            if (allSettle != null) {
-              if (pickCollFromAll(allSettle)) {
-                markPbOk();
-                return;
-              }
-              if (hasPluginBackendInAll(allSettle)) {
-                markPbOk();
-                return;
-              }
-            } else {
-              if (await findColl(data)) {
-                markPbOk();
-                return;
-              }
-              if (await hasPluginBackendOnWorkspace(data)) {
-                markPbOk();
-                return;
-              }
-            }
-          }
-        }
-        noteRecentPluginBackendCreateAttempt(data);
-        const exactN = await countExactPluginBackendNamedCollections(data);
-        if (exactN >= 1) {
-          if (DEBUG_COLLECTIONS) {
-            dlogPathB('abort_create_exact_backend_name_exists', { exactN, ws: workspaceSlugFromData(data) });
-          }
-          markPbOk();
-          return;
-        }
-        const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
-        if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
-          return;
-        }
-        const conf = cloneShape();
-        const base = coll.getConfiguration();
-        if (base && typeof base.ver === 'number') conf.ver = base.ver;
-        let ok = await coll.saveConfiguration(conf);
-        if (ok === false) {
-          // Transient host races can reject the first save; retry before giving up.
-          await new Promise((r) => setTimeout(r, 180));
-          ok = await coll.saveConfiguration(conf);
-        }
-        if (ok === false) return;
-        noteRecentPluginBackendCreate(data);
-        markPbOk();
-        await new Promise((r) => setTimeout(r, 250));
-      } finally {
-        try {
-          lease.release();
-        } catch (_) {}
-      }
-    } catch (e) {
-      console.error('[ThymerPluginSettings] ensure collection', e);
-    }
-  }
-
-  function runPluginBackendEnsureWithLocksOrChain(data) {
-    try {
-      if (typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function') {
-        if (DEBUG_COLLECTIONS) dlogPathB('ensure_route', { via: 'locks', lockName: PB_LOCK_NAME, pathB: pathBWindowSnapshot() });
-        return navigator.locks.request(PB_LOCK_NAME, () => runPluginBackendEnsureBody(data));
-      }
-    } catch (e) {
-      if (DEBUG_COLLECTIONS) dlogPathB('ensure_locks_threw', { err: String((e && e.message) || e) });
-    }
-    if (DEBUG_COLLECTIONS) dlogPathB('ensure_route', { via: 'hierarchyChain', pathB: pathBWindowSnapshot() });
-    return chainPluginBackendEnsure(data, () => runPluginBackendEnsureBody(data));
-  }
-
-  function ensurePluginSettingsCollection(data) {
-    if (!data || typeof data.getAllCollections !== 'function' || typeof data.createCollection !== 'function') {
-      return Promise.resolve();
-    }
-    if (isWorkspacePluginBackendEnsureDone(data)) {
-      return Promise.resolve();
-    }
-    if (DEBUG_COLLECTIONS) {
-      let dHint = 'no-data';
-      try {
-        dHint = data
-          ? `ctor=${(data && data.constructor && data.constructor.name) || '?'},eqPrev=${(data && data === g.__th_lastDataPb) || false},keys=${
-            Object.keys(data).filter((k) => k && (k.includes('thymer') || k.includes('__'))).length
-          }`
-          : 'null';
-        g.__th_lastDataPb = data;
-      } catch (_) {
-        dHint = 'err';
-      }
-      dlogPathB('ensurePluginSettingsCollection', { dataHint: dHint, dataExpand: (() => { try { if (!data) return { ok: false }; return { hasDataEnsure: !!data[DATA_ENSURE_P] }; } catch (_) { return { ok: 'throw' }; } })(), pathB: pathBWindowSnapshot() });
-    }
-    try {
-      if (!data[DATA_ENSURE_P] || typeof data[DATA_ENSURE_P].then !== 'function') {
-        data[DATA_ENSURE_P] = Promise.resolve();
-      }
-      if (DEBUG_COLLECTIONS) dlogPathB('data_ensure_p_chained', { hasPriorTail: true });
-      const next = data[DATA_ENSURE_P]
-        .catch(() => {})
-        .then(() => runPluginBackendEnsureWithLocksOrChain(data));
-      data[DATA_ENSURE_P] = next;
-      return next;
-    } catch (e) {
-      if (DEBUG_COLLECTIONS) dlogPathB('data_ensure_p_throw', { err: String((e && e.message) || e) });
-      return runPluginBackendEnsureWithLocksOrChain(data);
-    }
-  }
-
-  async function readDoc(data, pluginId) {
-    const coll = await findColl(data);
-    if (!coll) return null;
-    let records;
-    try {
-      records = await coll.getAllRecords();
-    } catch (_) {
-      return null;
-    }
-    const r = findVaultRecord(records, pluginId);
-    if (!r) return null;
-    let raw = '';
-    try {
-      raw = r.text?.('settings_json') || '';
-    } catch (_) {}
-    if (!raw || !String(raw).trim()) return null;
-    try {
-      return JSON.parse(raw);
-    } catch (_) {
-      return null;
-    }
-  }
-
-  async function writeDoc(data, pluginId, doc) {
-    const coll = await findColl(data);
-    if (!coll) return;
-    await upgradePluginSettingsSchema(data, coll);
-    const json = JSON.stringify(doc);
-    let records;
-    try {
-      records = await coll.getAllRecords();
-    } catch (_) {
-      return;
-    }
-    let r = findVaultRecord(records, pluginId);
-    if (!r) {
-      let guid = null;
-      try {
-        guid = coll.createRecord?.(pluginId);
-      } catch (_) {}
-      if (guid) {
-        for (let i = 0; i < 30; i++) {
-          await new Promise((res) => setTimeout(res, i < 8 ? 100 : 200));
-          try {
-            const again = await coll.getAllRecords();
-            r = again.find((x) => x.guid === guid) || findVaultRecord(again, pluginId);
-            if (r) break;
-          } catch (_) {}
-        }
-      }
-    }
-    if (!r) return;
-    applyVaultRowMeta(r, pluginId, coll);
-    try {
-      const pj = r.prop?.('settings_json');
-      if (pj && typeof pj.set === 'function') pj.set(json);
-    } catch (_) {}
-  }
-
-  const LOCAL_MIRROR_META_PREFIX = 'thymerext_ps_local_meta_v1:';
-
-  function localMirrorMetaKey(pluginId) {
-    return LOCAL_MIRROR_META_PREFIX + encodeURIComponent(String(pluginId || 'unknown'));
-  }
-
-  function parseIsoMs(s) {
-    const n = Date.parse(String(s || ''));
-    return Number.isFinite(n) ? n : 0;
-  }
-
-  function readLocalMirrorMeta(pluginId) {
-    try {
-      const raw = localStorage.getItem(localMirrorMetaKey(pluginId));
-      const parsed = raw ? JSON.parse(raw) : null;
-      if (parsed && typeof parsed === 'object') return parsed;
-    } catch (_) {}
-    return {};
-  }
-
-  function writeLocalMirrorMeta(pluginId, meta) {
-    try {
-      localStorage.setItem(localMirrorMetaKey(pluginId), JSON.stringify(meta || {}));
-    } catch (_) {}
-  }
-
-  function markLocalMirrorKeys(pluginId, keys, updatedAt) {
-    if (!pluginId || !Array.isArray(keys)) return;
-    const meta = readLocalMirrorMeta(pluginId);
-    const ts = updatedAt || new Date().toISOString();
-    let changed = false;
-    for (const k of keys) {
-      if (!k) continue;
-      let exists = false;
-      try {
-        exists = localStorage.getItem(k) !== null;
-      } catch (_) {}
-      if (!exists) continue;
-      meta[k] = { updatedAt: ts };
-      changed = true;
-    }
-    if (changed) writeLocalMirrorMeta(pluginId, meta);
-  }
-
-  function collectLocalMirrorPayload(keys) {
-    const payload = {};
-    if (!Array.isArray(keys)) return payload;
-    for (const k of keys) {
-      if (!k) continue;
-      try {
-        const v = localStorage.getItem(k);
-        if (v !== null) payload[k] = v;
-      } catch (_) {}
-    }
-    return payload;
-  }
-
-  function localPayloadMatchesRemote(keys, remote) {
-    if (!remote || !remote.payload || typeof remote.payload !== 'object') return false;
-    if (!Array.isArray(keys)) return true;
-    for (const k of keys) {
-      if (!k) continue;
-      let localValue = null;
-      try {
-        localValue = localStorage.getItem(k);
-      } catch (_) {}
-      const remoteValue = remote.payload[k];
-      if (localValue === null && typeof remoteValue !== 'string') continue;
-      if (localValue !== remoteValue) return false;
-    }
-    return true;
-  }
-
-  function applyRemoteMirrorPayload(pluginId, keys, remote) {
-    const result = { needsFlush: false };
-    if (!remote || !remote.payload || typeof remote.payload !== 'object') return result;
-    const meta = readLocalMirrorMeta(pluginId);
-    const remoteUpdatedAt = String(remote.updatedAt || '');
-    const remoteMs = parseIsoMs(remoteUpdatedAt);
-    let metaChanged = false;
-    for (const k of keys) {
-      if (!k) continue;
-      const remoteValue = remote.payload[k];
-      if (typeof remoteValue !== 'string') continue;
-
-      let localValue = null;
-      try {
-        localValue = localStorage.getItem(k);
-      } catch (_) {}
-
-      if (localValue === remoteValue) {
-        if (remoteUpdatedAt && (!meta[k] || !meta[k].updatedAt)) {
-          meta[k] = { updatedAt: remoteUpdatedAt };
-          metaChanged = true;
-        }
-        continue;
-      }
-
-      if (localValue === null) {
-        try {
-          localStorage.setItem(k, remoteValue);
-          if (remoteUpdatedAt) {
-            meta[k] = { updatedAt: remoteUpdatedAt };
-            metaChanged = true;
-          }
-        } catch (_) {}
-        continue;
-      }
-
-      const localMs = parseIsoMs(meta[k]?.updatedAt);
-      if (localMs && remoteMs && remoteMs > localMs + 1000) {
-        try {
-          localStorage.setItem(k, remoteValue);
-          meta[k] = { updatedAt: remoteUpdatedAt };
-          metaChanged = true;
-        } catch (_) {}
-        continue;
-      }
-
-      // When freshness is ambiguous, preserve the browser's current settings and let flushNow repair the vault row.
-      result.needsFlush = true;
-      if (!localMs) {
-        meta[k] = { updatedAt: new Date().toISOString() };
-        metaChanged = true;
-      }
-      console.warn('[ThymerPluginSettings] Kept local settings instead of overwriting with older/ambiguous synced payload', {
-        pluginId,
-        key: k,
-        localUpdatedAt: meta[k]?.updatedAt || null,
-        remoteUpdatedAt: remoteUpdatedAt || null,
-      });
-    }
-    if (metaChanged) writeLocalMirrorMeta(pluginId, meta);
-    return result;
-  }
-
-  function shouldFlushMirrorOnInit(keys, remote, applyResult) {
-    if (applyResult?.needsFlush) return true;
-    if (remote && remote.payload && typeof remote.payload === 'object') {
-      return !localPayloadMatchesRemote(keys, remote);
-    }
-    return Object.keys(collectLocalMirrorPayload(keys)).length > 0;
-  }
-
-  async function listRows(data, { pluginSlug, recordKind } = {}) {
-    const slug = (pluginSlug || '').trim();
-    if (!slug) return [];
-    const coll = await findColl(data);
-    if (!coll) return [];
-    let records;
-    try {
-      records = await coll.getAllRecords();
-    } catch (_) {
-      return [];
-    }
-    const plugCol = pluginColumnPropId(coll, FIELD_PLUGIN);
-    return records.filter((r) => {
-      const pid = rowField(r, 'plugin_id');
-      let rowSlug = rowField(r, plugCol);
-      if (!rowSlug) rowSlug = inferPluginSlugFromPid(pid);
-      if (rowSlug !== slug) return false;
-      if (recordKind != null && String(recordKind) !== '') {
-        const rk = rowField(r, FIELD_KIND) || inferRecordKindFromPid(pid, slug);
-        return rk === String(recordKind);
-      }
-      return true;
-    });
-  }
-
-  async function createDataRow(data, { pluginSlug, recordKind, rowPluginId, recordTitle, settingsDoc } = {}) {
-    const ps = (pluginSlug || '').trim();
-    const rid = (rowPluginId || '').trim();
-    const kind = (recordKind || '').trim();
-    if (!ps || !rid || !kind) {
-      console.warn('[ThymerPluginSettings] createDataRow: pluginSlug, recordKind, and rowPluginId are required');
-      return null;
-    }
-    if (rid === ps && kind !== KIND_VAULT) {
-      console.warn('[ThymerPluginSettings] createDataRow: rowPluginId must differ from plugin slug unless record_kind is vault');
-    }
-    await ensurePluginSettingsCollection(data);
-    const coll = await findColl(data);
-    if (!coll) return null;
-    await upgradePluginSettingsSchema(data, coll);
-    const title = (recordTitle || rid).trim() || rid;
-    let guid = null;
-    try {
-      guid = coll.createRecord?.(title);
-    } catch (e) {
-      console.error('[ThymerPluginSettings] createDataRow createRecord', e);
-      return null;
-    }
-    if (!guid) return null;
-    let r = null;
-    for (let i = 0; i < 30; i++) {
-      await new Promise((res) => setTimeout(res, i < 8 ? 100 : 200));
-      try {
-        const again = await coll.getAllRecords();
-        r = again.find((x) => x.guid === guid) || again.find((x) => rowField(x, 'plugin_id') === rid);
-        if (r) break;
-      } catch (_) {}
-    }
-    if (!r) return null;
-    setRowField(r, 'plugin_id', rid);
-    setRowField(r, FIELD_PLUGIN, ps, coll);
-    setRowField(r, FIELD_KIND, kind);
-    const json =
-      settingsDoc !== undefined && settingsDoc !== null
-        ? typeof settingsDoc === 'string'
-          ? settingsDoc
-          : JSON.stringify(settingsDoc)
-        : '{}';
-    try {
-      const pj = r.prop?.('settings_json');
-      if (pj && typeof pj.set === 'function') pj.set(json);
-    } catch (_) {}
-    return r;
-  }
-
-  function showFirstRunDialog(ui, label, preferred, onPick) {
-    const id = 'thymerext-ps-first-' + Math.random().toString(36).slice(2);
-    const box = document.createElement('div');
-    box.id = id;
-    box.style.cssText =
-      'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:16px;';
-    const card = document.createElement('div');
-    card.style.cssText =
-      'max-width:420px;width:100%;background:var(--panel-bg-color,#1d1915);border:1px solid var(--border-default,#3f3f46);border-radius:12px;padding:20px;box-shadow:0 8px 32px rgba(0,0,0,0.5);';
-    const title = document.createElement('div');
-    title.textContent = label + ' — where to store settings?';
-    title.style.cssText = 'font-weight:700;font-size:15px;margin-bottom:10px;';
-    const hint = document.createElement('div');
-    hint.textContent = 'Change later via Command Palette → “Storage location…”';
-    hint.style.cssText = 'font-size:12px;color:var(--text-muted,#888);margin-bottom:16px;line-height:1.45;';
-    const mk = (t, sub, prim) => {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.style.cssText =
-        'display:block;width:100%;text-align:left;padding:12px 14px;margin-bottom:10px;border-radius:8px;cursor:pointer;font-size:14px;border:1px solid var(--border-default,#3f3f46);background:' +
-        (prim ? 'rgba(167,139,250,0.25)' : 'transparent') +
-        ';color:inherit;';
-      const x = document.createElement('div');
-      x.textContent = t;
-      x.style.fontWeight = '600';
-      b.appendChild(x);
-      if (sub) {
-        const s = document.createElement('div');
-        s.textContent = sub;
-        s.style.cssText = 'font-size:11px;opacity:0.75;margin-top:4px;line-height:1.35;';
-        b.appendChild(s);
-      }
-      return b;
-    };
-    const bLoc = mk('This device only', 'Browser localStorage only.', preferred === 'local');
-    const bSyn = mk(
-      'Sync across devices',
-      'Store in the workspace “' + COL_NAME + '” collection (same account on any browser).',
-      preferred === 'synced'
-    );
-    const fin = (m) => {
-      try {
-        box.remove();
-      } catch (_) {}
-      onPick(m);
-    };
-    bLoc.addEventListener('click', () => fin('local'));
-    bSyn.addEventListener('click', () => fin('synced'));
-    card.appendChild(title);
-    card.appendChild(hint);
-    card.appendChild(bLoc);
-    card.appendChild(bSyn);
-    box.appendChild(card);
-    document.body.appendChild(box);
-  }
-
-  g.ThymerPluginSettings = {
-    COL_NAME,
-    COL_NAME_LEGACY,
-    FIELD_PLUGIN,
-    FIELD_RECORD_KIND: FIELD_KIND,
-    RECORD_KIND_VAULT: KIND_VAULT,
-    enqueue,
-    rowField,
-    findVaultRecord,
-    listRows,
-    createDataRow,
-    upgradeCollectionSchema: (data) => upgradePluginSettingsSchema(data),
-    registerPluginSlug,
-    preferDeferredHeavyWork,
-    yieldToHostBeforePathB,
-    ensureMobileLoadGraceStarted,
-    inMobileLoadGrace,
-    bumpMobileLoadGrace,
-    installMobileResumeGraceListener,
-
-    async init(opts) {
-      ensureStartupStormWindow();
-      installMobileResumeGraceListener();
-      installMobileInteractionGraceListener();
-      await yieldToHostBeforePathB();
-      const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
-
-      let mode = null;
-      try {
-        mode = localStorage.getItem(modeKey);
-      } catch (_) {}
-
-      const remote = await readDoc(data, pluginId);
-      if (!mode && remote && (remote.storageMode === 'synced' || remote.storageMode === 'local')) {
-        mode = remote.storageMode;
-        try {
-          localStorage.setItem(modeKey, mode);
-        } catch (_) {}
-      }
-
-      if (!mode) {
-        const coll = await findColl(data);
-        const preferred = coll ? 'synced' : 'local';
-        await new Promise((r) => {
-          requestAnimationFrame(() => requestAnimationFrame(() => r()));
-        });
-        await new Promise((outerResolve) => {
-          enqueue(async () => {
-            const picked = await new Promise((r) => {
-              showFirstRunDialog(ui, label, preferred, r);
-            });
-            try {
-              localStorage.setItem(modeKey, picked);
-            } catch (_) {}
-            outerResolve(picked);
-          });
-        });
-        try {
-          mode = localStorage.getItem(modeKey);
-        } catch (_) {}
-      }
-
-      plugin._pluginSettingsSyncMode = mode === 'synced' ? 'synced' : 'local';
-      plugin._pluginSettingsPluginId = pluginId;
-      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
-      let initFlushNeeded = false;
-
-      if (plugin._pluginSettingsSyncMode === 'synced' && remote && remote.payload && typeof remote.payload === 'object') {
-        const applyResult = applyRemoteMirrorPayload(pluginId, keys, remote);
-        initFlushNeeded = shouldFlushMirrorOnInit(keys, remote, applyResult);
-      } else if (plugin._pluginSettingsSyncMode === 'synced') {
-        initFlushNeeded = shouldFlushMirrorOnInit(keys, remote, null);
-      }
-
-      if (plugin._pluginSettingsSyncMode === 'synced' && initFlushNeeded) {
-        try {
-          markLocalMirrorKeys(pluginId, keys);
-          await g.ThymerPluginSettings.flushNow(data, pluginId, keys);
-        } catch (_) {}
-      }
-    },
-
-    scheduleFlush(plugin, mirrorKeys) {
-      if (plugin._pluginSettingsSyncMode !== 'synced') return;
-      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
-      markLocalMirrorKeys(plugin._pluginSettingsPluginId, keys);
-      if (plugin._pluginSettingsFlushTimer) clearTimeout(plugin._pluginSettingsFlushTimer);
-      plugin._pluginSettingsFlushTimer = setTimeout(() => {
-        plugin._pluginSettingsFlushTimer = null;
-        const pdata = plugin.data;
-        const pid = plugin._pluginSettingsPluginId;
-        if (!pid || !pdata) return;
-        g.ThymerPluginSettings.flushNow(pdata, pid, keys).catch((e) => console.error('[ThymerPluginSettings] flush', e));
-      }, 500);
-    },
-
-    async flushNow(data, pluginId, mirrorKeys) {
-      await ensurePluginSettingsCollection(data);
-      await upgradePluginSettingsSchema(data);
-      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
-      const payload = {};
-      for (const k of keys) {
-        try {
-          const v = localStorage.getItem(k);
-          if (v !== null) payload[k] = v;
-        } catch (_) {}
-      }
-      const doc = {
-        v: 1,
-        storageMode: 'synced',
-        updatedAt: new Date().toISOString(),
-        payload,
-      };
-      await writeDoc(data, pluginId, doc);
-    },
-
-    async openStorageDialog(opts) {
-      const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
-      const cur = plugin._pluginSettingsSyncMode === 'synced' ? 'synced' : 'local';
-      const pick = await new Promise((resolve) => {
-        const close = (v) => {
-          try {
-            box.remove();
-          } catch (_) {}
-          resolve(v);
-        };
-        const box = document.createElement('div');
-        box.style.cssText =
-          'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:16px;';
-        box.addEventListener('click', (e) => {
-          if (e.target === box) close(null);
-        });
-        const card = document.createElement('div');
-        card.style.cssText =
-          'max-width:400px;width:100%;background:var(--panel-bg-color,#1d1915);border:1px solid var(--border-default,#3f3f46);border-radius:12px;padding:18px;';
-        card.addEventListener('click', (e) => e.stopPropagation());
-        const t = document.createElement('div');
-        t.textContent = label + ' — storage';
-        t.style.cssText = 'font-weight:700;margin-bottom:12px;';
-        const b1 = document.createElement('button');
-        b1.type = 'button';
-        b1.textContent = 'This device only';
-        const b2 = document.createElement('button');
-        b2.type = 'button';
-        b2.textContent = 'Sync across devices';
-        [b1, b2].forEach((b) => {
-          b.style.cssText =
-            'display:block;width:100%;padding:10px 12px;margin-bottom:8px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;text-align:left;';
-        });
-        b1.addEventListener('click', () => close('local'));
-        b2.addEventListener('click', () => close('synced'));
-        const bx = document.createElement('button');
-        bx.type = 'button';
-        bx.textContent = 'Cancel';
-        bx.style.cssText =
-          'margin-top:8px;padding:8px 14px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;';
-        bx.addEventListener('click', () => close(null));
-        card.appendChild(t);
-        card.appendChild(b1);
-        card.appendChild(b2);
-        card.appendChild(bx);
-        box.appendChild(card);
-        document.body.appendChild(box);
-      });
-      if (!pick || pick === cur) return;
-      try {
-        localStorage.setItem(modeKey, pick);
-      } catch (_) {}
-      plugin._pluginSettingsSyncMode = pick === 'synced' ? 'synced' : 'local';
-      const keyList = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
-      if (pick === 'synced') {
-        markLocalMirrorKeys(pluginId, keyList);
-        await g.ThymerPluginSettings.flushNow(data, pluginId, keyList);
-      }
-      ui.addToaster?.({
-        title: label,
-        message: pick === 'synced' ? 'Settings will sync across devices.' : 'Settings stay on this device only.',
-        dismissible: true,
-        autoDestroyTime: 3500,
-      });
-    },
-  };
-
-  g.thymerExtEnsureMobileLoadGrace = ensureMobileLoadGraceStarted;
-  g.thymerExtInMobileLoadGrace = inMobileLoadGrace;
-  g.thymerExtPreferDeferredHeavyWork = preferDeferredHeavyWork;
-  g.thymerExtShouldDeferPanelFooterWork = shouldDeferPanelFooterWork;
-  g.thymerExtBumpMobileLoadGrace = bumpMobileLoadGrace;
-  g.thymerExtPauseHeavyWorkQueue = pauseHeavyWorkQueue;
-  g.thymerExtInstallMobileResumeGrace = installMobileResumeGraceListener;
-  g.thymerExtInstallMobileInteractionGrace = installMobileInteractionGraceListener;
-  g.thymerExtEnqueueHeavyWork = enqueueHeavyWork;
-  g.thymerExtScheduleAfterMobileLoadGrace = scheduleAfterMobileLoadGrace;
-  g.thymerExtEnsureStartupStormWindow = ensureStartupStormWindow;
-  g.thymerExtInStartupStormWindow = inStartupStormWindow;
-  g.thymerExtEndStartupStormWindow = endStartupStormWindow;
-  g.thymerExtScheduleAfterStartupStorm = scheduleAfterStartupStorm;
-})(typeof globalThis !== 'undefined' ? globalThis : window);
-// @generated END thymer-plugin-settings
+}
+/**
+ * Dawn YNAB engine — prod dashboard + income widget chrome.
+ * Instantiated by Tier2. JHS tab (no panel.navigated). Network onDemand.
+ */
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────────
 
 const YNAB_COLLECTION_NAME = 'YNAB';
+/** darienx YNAB txn collection (Income vs Expenses). */
+const YNAB_COLLECTION_GUID = '1JK4KABKZHT6G8CBGF0QV64NTD';
 const CACHE_TTL_MS  = 15 * 60 * 1000;
 const CHART_JS_URL  = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js';
 
@@ -2545,24 +98,47 @@ const C = {
 };
 
 const SK = {
-  TOKEN:           'ynab_pat',
-  BUDGET_ID:       'ynab_budget_id',
-  BUDGET_NAME:     'ynab_budget_name',
-  CACHE_TXN:       'ynab_txn_cache_v4',
-  CACHE_CATS:      'ynab_cats_v4',
-  CACHE_CATS_TS:   'ynab_cats_ts_v4',
-  CACHE_TS:        'ynab_txn_cache_ts',
-  EXCLUDED_GROUPS: 'ynab_excluded_groups',
-  WIDGET_PERIOD:   'ynab_widget_period',
-  WIDGET_CHART:    'ynab_widget_chart',
-  WIDGET_COMPARE:  'ynab_widget_compare',
-  WIDGET_AVG:      'ynab_widget_avg',
-  WIDGET_COLLAPSE: 'ynab_widget_collapse',
-  DASH_FROM:       'ynab_dash_from',
-  DASH_TO:         'ynab_dash_to',
-  EXCL_PAYEES:     'ynab_excl_payees',
-  INCL_PAYEES:     'ynab_incl_payees_v4',   // null = not yet configured (use defaults)
+  TOKEN:           'dawn:ynab_pat',
+  BUDGET_ID:       'dawn:ynab_budget_id',
+  BUDGET_NAME:     'dawn:ynab_budget_name',
+  CACHE_TXN:       'dawn:ynab_txn_cache_v4',
+  CACHE_CATS:      'dawn:ynab_cats_v4',
+  CACHE_CATS_TS:   'dawn:ynab_cats_ts_v4',
+  CACHE_TS:        'dawn:ynab_txn_cache_ts',
+  EXCLUDED_GROUPS: 'dawn:ynab_excluded_groups',
+  WIDGET_PERIOD:   'dawn:ynab_widget_period',
+  WIDGET_CHART:    'dawn:ynab_widget_chart',
+  WIDGET_COMPARE:  'dawn:ynab_widget_compare',
+  WIDGET_AVG:      'dawn:ynab_widget_avg',
+  WIDGET_COLLAPSE: 'dawn:ynab_widget_collapse',
+  DASH_FROM:       'dawn:ynab_dash_from',
+  DASH_TO:         'dawn:ynab_dash_to',
+  EXCL_PAYEES:     'dawn:ynab_excl_payees',
+  INCL_PAYEES:     'dawn:ynab_incl_payees_v4',
 };
+
+/** Keys synced via Plugin Backend. Cache blobs stay local — vault round-trips were
+ *  overwriting fresher API caches with stale snapshots (e.g. missing July 2025). */
+const SK_CACHE_KEYS = new Set([SK.CACHE_TXN, SK.CACHE_CATS, SK.CACHE_CATS_TS, SK.CACHE_TS]);
+const SK_PROD_KEY = (dawnKey) => (String(dawnKey).startsWith('dawn:') ? dawnKey.slice(5) : dawnKey);
+const SK_PATHB_MIRROR = () => {
+  const dawn = Object.values(SK).filter((k) => !SK_CACHE_KEYS.has(k));
+  const prod = dawn.map(SK_PROD_KEY);
+  return [...new Set([...prod, ...dawn])];
+};
+
+function ynabCopyProdLsIfEmpty() {
+  for (const dawnKey of Object.values(SK)) {
+    const prodKey = SK_PROD_KEY(dawnKey);
+    if (!prodKey || prodKey === dawnKey) continue;
+    try {
+      if (String(localStorage.getItem(dawnKey) || '').trim()) continue;
+      const v = localStorage.getItem(prodKey);
+      if (v == null || v === '') continue;
+      localStorage.setItem(dawnKey, v);
+    } catch (_) {}
+  }
+}
 
 /** localStorage: `'on'` | `'off'` — when absent, use collection `custom.mount_journal_income_widget`. */
 const YNAB_JWIDGET_OVERRIDE_LS = 'ynab_journal_income_widget_override';
@@ -2580,15 +156,38 @@ const DEFAULT_EXCLUDED = [
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ls      = k    => { try { return localStorage.getItem(k); } catch { return null; } };
-function ynabPluginSettingsFlush() {
+/** UI toggles flush on a short debounce so Path B / panel refresh doesn't race mid-click. */
+const YNAB_UI_FLUSH_KEYS = new Set([
+  SK.WIDGET_PERIOD, SK.WIDGET_CHART, SK.WIDGET_COMPARE, SK.WIDGET_AVG,
+  SK.WIDGET_COLLAPSE, SK.DASH_FROM, SK.DASH_TO,
+]);
+let _ynabUiFlushTimer = null;
+function ynabPluginSettingsFlush(immediate = false) {
   try {
     const p = globalThis.__ynabPluginSettingsPlugin;
-    if (p) globalThis.ThymerPluginSettings?.scheduleFlush?.(p, () => Object.values(SK));
+    if (!p) return;
+    const run = () => {
+      _ynabUiFlushTimer = null;
+      globalThis.ThymerPluginSettings?.scheduleFlush?.(p, SK_PATHB_MIRROR);
+    };
+    if (immediate) {
+      if (_ynabUiFlushTimer != null) { try { clearTimeout(_ynabUiFlushTimer); } catch (_) {} _ynabUiFlushTimer = null; }
+      run();
+      return;
+    }
+    if (_ynabUiFlushTimer != null) try { clearTimeout(_ynabUiFlushTimer); } catch (_) {}
+    _ynabUiFlushTimer = setTimeout(run, 700);
   } catch (_) {}
 }
-const lsSet   = (k,v)=> { try { localStorage.setItem(k, String(v)); } catch {} ynabPluginSettingsFlush(); };
+const lsSet   = (k,v)=> {
+  try { localStorage.setItem(k, String(v)); } catch {}
+  ynabPluginSettingsFlush(!YNAB_UI_FLUSH_KEYS.has(k));
+};
 const lsJson  = (k,d)=> { try { const v = ls(k); return v ? JSON.parse(v) : d; } catch { return d; } };
-const lsJsonSet=(k,v)=> { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} ynabPluginSettingsFlush(); };
+const lsJsonSet=(k,v)=> {
+  try { localStorage.setItem(k, JSON.stringify(v)); } catch {}
+  ynabPluginSettingsFlush(!YNAB_UI_FLUSH_KEYS.has(k));
+};
 const sleep   = ms   => new Promise(r => setTimeout(r, ms));
 
 /** Thymer datetime fields require DateTimeValue — not raw Date (SDK/runtime). */
@@ -2658,11 +257,209 @@ function journalDateFromRecord(record) {
   return null;
 }
 
-// Returns YYYY-MM-DD string
-function dateStr(d) { return d.toISOString().slice(0, 10); }
+/** Local calendar YYYY-MM-DD (avoid toISOString UTC day-shift). */
+function dateStr(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+/** Normalize any date-ish value to YYYY-MM-DD for reliable string compares. */
+function ymd(v) {
+  if (v == null) return '';
+  // Thymer datetime prop value: { d: "20250701", formatted: "Tue Jul 1 2025" }
+  if (typeof v === 'object' && !(v instanceof Date)) {
+    try {
+      if (typeof v.value === 'function') {
+        const inner = v.value();
+        if (inner && inner !== v) return ymd(inner);
+      }
+    } catch (_) {}
+    if (v.d != null) {
+      const raw = String(v.d).replace(/\D/g, '');
+      if (raw.length >= 8) {
+        return `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
+      }
+    }
+    try {
+      if (typeof v.toDate === 'function') {
+        const d = v.toDate();
+        if (d instanceof Date && !Number.isNaN(d.getTime())) return dateStr(d);
+      }
+    } catch (_) {}
+    // Don't leak "[object Object]" into range compares — that zeros the whole dash.
+    return '';
+  }
+  if (v instanceof Date) {
+    return Number.isNaN(v.getTime()) ? '' : dateStr(v);
+  }
+  const s = String(v).trim();
+  if (!s || s === '[object Object]') return '';
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  // Compact YYYMMDD (sometimes appears in caches / Thymer exports)
+  if (/^\d{8}$/.test(s)) return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) return dateStr(d);
+  return '';
+}
+
+function inYmdRange(dateVal, from, to) {
+  const d = ymd(dateVal);
+  if (!d) return false;
+  if (from && d < ymd(from)) return false;
+  if (to && d > ymd(to)) return false;
+  return true;
+}
+
+/** Month axis label with full 4-digit year (e.g. "Jan 2025"). */
+function monthYearLabel(d) {
+  return d.toLocaleString('en-US', { month: 'short', year: 'numeric' });
+}
+
+const MAX_DAY_BARS = 45;
+const MAX_WEEK_BARS = 26;
+
+/**
+ * Bucket a date range for the dashboard chart.
+ * Honors daily|weekly|monthly preference — never silently switches Daily → Monthly.
+ * Long daily/weekly ranges window to the end of the selection instead.
+ */
+function buildRangeBuckets(from, to, prefer = 'monthly') {
+  const fromDate = new Date(`${ymd(from)}T12:00:00`);
+  const toDate = new Date(`${ymd(to)}T12:00:00`);
+  if (Number.isNaN(fromDate.getTime()) || Number.isNaN(toDate.getTime()) || fromDate > toDate) {
+    return { keys: [], labels: [], grain: 'month', windowNote: '', prefer };
+  }
+  const dayMs = 86400000;
+  const daysApprox = Math.round((toDate - fromDate) / dayMs) + 1;
+  const monthsApprox =
+    (toDate.getFullYear() - fromDate.getFullYear()) * 12 +
+    (toDate.getMonth() - fromDate.getMonth()) + 1;
+
+  let grain = 'month';
+  let windowNote = '';
+  let viewFrom = new Date(fromDate);
+  let viewTo = new Date(toDate);
+
+  if (prefer === 'daily') {
+    grain = 'day';
+    if (daysApprox > MAX_DAY_BARS) {
+      viewFrom = new Date(toDate);
+      viewFrom.setDate(viewFrom.getDate() - (MAX_DAY_BARS - 1));
+      if (viewFrom < fromDate) viewFrom = new Date(fromDate);
+      windowNote = `last ${MAX_DAY_BARS} days`;
+    }
+  } else if (prefer === 'weekly') {
+    grain = 'week';
+    if (daysApprox > MAX_WEEK_BARS * 7) {
+      viewFrom = new Date(toDate);
+      viewFrom.setDate(viewFrom.getDate() - (MAX_WEEK_BARS * 7 - 1));
+      if (viewFrom < fromDate) viewFrom = new Date(fromDate);
+      windowNote = `last ${MAX_WEEK_BARS} weeks`;
+    }
+  } else {
+    grain = monthsApprox > 48 ? 'year' : monthsApprox > 24 ? 'quarter' : 'month';
+  }
+
+  const keys = [];
+  const labels = [];
+  let guard = 0;
+  if (grain === 'day') {
+    const d = new Date(viewFrom);
+    while (d <= viewTo && guard++ < 800) {
+      const k = dateStr(d);
+      keys.push(k);
+      labels.push(k.slice(5).replace('-', '.'));
+      d.setDate(d.getDate() + 1);
+    }
+  } else if (grain === 'week') {
+    const wkStart = (d) => {
+      const dt = new Date(d);
+      dt.setDate(dt.getDate() - dt.getDay());
+      dt.setHours(12, 0, 0, 0);
+      return dt;
+    };
+    let s = wkStart(viewFrom);
+    const end = wkStart(viewTo);
+    while (s <= end && guard++ < 400) {
+      const k = dateStr(s);
+      keys.push(`W:${k}`);
+      labels.push(k.slice(5).replace('-', '.'));
+      s.setDate(s.getDate() + 7);
+    }
+  } else if (grain === 'year') {
+    let y = fromDate.getFullYear();
+    const yEnd = toDate.getFullYear();
+    while (y <= yEnd && guard++ < 200) {
+      keys.push(String(y));
+      labels.push(String(y));
+      y += 1;
+    }
+  } else if (grain === 'quarter') {
+    let y = fromDate.getFullYear();
+    let q = Math.floor(fromDate.getMonth() / 3);
+    const endY = toDate.getFullYear();
+    const endQ = Math.floor(toDate.getMonth() / 3);
+    while ((y < endY || (y === endY && q <= endQ)) && guard++ < 400) {
+      keys.push(`${y}-Q${q + 1}`);
+      labels.push(`Q${q + 1} ${y}`);
+      q += 1;
+      if (q > 3) { q = 0; y += 1; }
+    }
+  } else {
+    const d = new Date(fromDate.getFullYear(), fromDate.getMonth(), 1);
+    const end = new Date(toDate.getFullYear(), toDate.getMonth(), 1);
+    while (d <= end && guard++ < 600) {
+      const y = d.getFullYear();
+      const m = d.getMonth() + 1;
+      keys.push(`${y}-${String(m).padStart(2, '0')}`);
+      labels.push(monthYearLabel(d));
+      d.setMonth(d.getMonth() + 1);
+    }
+  }
+  return { keys, labels, grain, windowNote, prefer };
+}
+
+function txnInRangeBucket(t, key, grain) {
+  const d = ymd(t?.date);
+  if (!d) return false;
+  if (grain === 'day') return d === key;
+  if (grain === 'week') {
+    const start = key.startsWith('W:') ? key.slice(2) : key;
+    const s = new Date(`${start}T12:00:00`);
+    if (Number.isNaN(s.getTime())) return false;
+    const e = new Date(s);
+    e.setDate(e.getDate() + 6);
+    return d >= dateStr(s) && d <= dateStr(e);
+  }
+  if (grain === 'year') return d.startsWith(key);
+  if (grain === 'quarter') {
+    const [y, qStr] = key.split('-Q');
+    const q = parseInt(qStr, 10);
+    if (!y || !(q >= 1 && q <= 4)) return false;
+    const m0 = (q - 1) * 3 + 1;
+    for (let i = 0; i < 3; i++) {
+      if (d.startsWith(`${y}-${String(m0 + i).padStart(2, '0')}`)) return true;
+    }
+    return false;
+  }
+  return d.startsWith(key);
+}
+
+/** Oldest YYYY-MM-DD among loaded txns (empty string if none). */
+function oldestTxnYmd(txns) {
+  let min = '';
+  for (const t of txns || []) {
+    const d = ymd(t?.date);
+    if (d && (!min || d < min)) min = d;
+  }
+  return min;
+}
 
 // Date range presets — all return { from: 'YYYY-MM-DD', to: 'YYYY-MM-DD' }
-function presets() {
+// All Time starts at the oldest loaded txn (not a hardcoded epoch).
+function presets(oldestYmd) {
   const now   = new Date();
   const y     = now.getFullYear();
   const m     = now.getMonth();
@@ -2674,6 +471,9 @@ function presets() {
   const firstOfYear  = new Date(y, 0, 1);
   const firstOfLastYear  = new Date(y - 1, 0, 1);
   const lastOfLastYear   = new Date(y - 1, 11, 31);
+  const allFrom = (oldestYmd && /^\d{4}-\d{2}-\d{2}/.test(oldestYmd))
+    ? oldestYmd.slice(0, 10)
+    : dateStr(now);
 
   return [
     { label: 'This Month',  from: dateStr(firstOfMonth),    to: dateStr(lastOfMonth) },
@@ -2681,7 +481,7 @@ function presets() {
     { label: 'YTD',         from: dateStr(firstOfYear),     to: dateStr(now) },
     { label: 'Last Year',   from: dateStr(firstOfLastYear), to: dateStr(lastOfLastYear) },
     { label: 'Last 90d',    from: dateStr(new Date(now - 90*864e5)), to: dateStr(now) },
-    { label: 'All Time',    from: '2000-01-01',             to: dateStr(now) },
+    { label: 'All Time',    from: allFrom,                 to: dateStr(now) },
   ];
 }
 
@@ -2692,8 +492,8 @@ function isIncomeTransaction(t, allTxns) {
   if (t.type !== 'income') return false;
   const raw = ls(SK.INCL_PAYEES);
   if (raw) {
-    const incl = new Set(JSON.parse(raw));
-    return incl.has(t.payee);
+    const incl = JSON.parse(raw).map((p) => String(p).trim().toLowerCase());
+    return incl.includes(String(t.payee || '').trim().toLowerCase());
   }
   // Default: exclude transfer-like payees
   return !['transfer','starting'].some(kw => t.payee.toLowerCase().includes(kw));
@@ -2784,7 +584,7 @@ function processTxns(raw, groupMap = {}) {
 
         results.push({
           id:             `${t.id}_${sub.id}`, // unique ID per sub-line
-          date:           t.date,
+          date:           ymd(t.date),
           payee:          t.payee_name || '',
           amount:         sub.amount / 1000,
           category:       sub.category_name || 'Uncategorized',
@@ -2800,7 +600,7 @@ function processTxns(raw, groupMap = {}) {
       // Normal (non-split) transaction
       results.push({
         id:             t.id,
-        date:           t.date,
+        date:           ymd(t.date),
         payee:          t.payee_name || '',
         amount:         t.amount / 1000,
         category:       t.category_name || 'Uncategorized',
@@ -2824,10 +624,21 @@ function processTxns(raw, groupMap = {}) {
 function getCached() {
   const ts = ls(SK.CACHE_TS);
   if (!ts || Date.now() - parseInt(ts, 10) > CACHE_TTL_MS) return null;
-  return lsJson(SK.CACHE_TXN, null);
+  const raw = lsJson(SK.CACHE_TXN, null);
+  if (!Array.isArray(raw)) return null;
+  // Normalize dates on read so older cache entries still compare correctly.
+  return raw.map((t) => (t && t.date && t.date.length !== 10 ? { ...t, date: ymd(t.date) } : t));
 }
-function setCache(txns) { lsJsonSet(SK.CACHE_TXN, txns); lsSet(SK.CACHE_TS, Date.now()); }
-function bustCache()    { lsSet(SK.CACHE_TS, '0'); }
+function setCache(txns) {
+  try {
+    localStorage.setItem(SK.CACHE_TXN, JSON.stringify(txns));
+    localStorage.setItem(SK.CACHE_TS, String(Date.now()));
+  } catch (e) {
+    try { console.warn('[YNAB] cache write failed (quota?)', e); } catch (_) {}
+  }
+  ynabPluginSettingsFlush(true);
+}
+function bustCache()    { lsSet(SK.CACHE_TS, '0'); try { localStorage.removeItem(SK.CACHE_TXN); } catch (_) {} }
 
 async function getTransactions(force = false) {
   if (!force) { const c = getCached(); if (c) return c; }
@@ -2841,6 +652,97 @@ async function getTransactions(force = false) {
   const txns = processTxns(rawTxns, groupMap);
   setCache(txns);
   return txns;
+}
+
+/** Read a Thymer record field with several SDK shapes. */
+function ynabRecField(record, id) {
+  try {
+    if (typeof record.text === 'function') {
+      const t = record.text(id);
+      if (t != null && t !== '') return t;
+    }
+  } catch (_) {}
+  try {
+    const p = record.prop?.(id);
+    if (!p) return null;
+    if (typeof p.getChoice === 'function') {
+      try {
+        const c = p.getChoice();
+        if (c != null && c !== '') return c;
+      } catch (_) {}
+    }
+    if (typeof p.get === 'function') {
+      const v = p.get();
+      // MCP/SDK sometimes returns ["datetime", { d: "20250701" }] / ["text", "…"]
+      if (Array.isArray(v) && v.length >= 2) return v[1];
+      return v;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function ynabRecDateYmd(record) {
+  // Prefer title — sync always writes "YYYY-MM-DD · payee · $amount"
+  try {
+    const name = (typeof record.getName === 'function' ? record.getName() : '') || record.name || '';
+    const m = String(name).match(/(\d{4}-\d{2}-\d{2})/);
+    if (m) return m[1];
+  } catch (_) {}
+  // Thymer datetime accessor (same pattern as other plugins)
+  try {
+    const dt = record.datetime?.('date') || record.prop?.('date')?.datetime?.();
+    if (dt) {
+      const fromDt = ymd(dt);
+      if (fromDt) return fromDt;
+      try {
+        if (typeof dt.value === 'function') {
+          const fromVal = ymd(dt.value());
+          if (fromVal) return fromVal;
+        }
+      } catch (_) {}
+      try {
+        if (typeof dt.toDate === 'function') {
+          const fromDate = ymd(dt.toDate());
+          if (fromDate) return fromDate;
+        }
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return ymd(ynabRecField(record, 'date'));
+}
+
+/** Map YNAB collection rows → dashboard txn shape (source of truth the user can see). */
+function txnsFromYnabRecords(records) {
+  const out = [];
+  let skipped = 0;
+  for (const r of records || []) {
+    const date = ynabRecDateYmd(r);
+    if (!date) { skipped++; continue; }
+    const rawAmt = Number(ynabRecField(r, 'amount'));
+    if (!Number.isFinite(rawAmt)) { skipped++; continue; }
+    const typeRaw = String(ynabRecField(r, 'transaction_type') || '').toLowerCase();
+    let type;
+    if (typeRaw.includes('income')) type = 'income';
+    else if (typeRaw.includes('expense')) type = 'expense';
+    else type = rawAmt >= 0 ? 'income' : 'expense';
+    out.push({
+      id: String(ynabRecField(r, 'ynab_id') || r.guid || ''),
+      date,
+      payee: String(ynabRecField(r, 'payee') || ''),
+      amount: Math.abs(rawAmt),
+      category: String(ynabRecField(r, 'category') || 'Uncategorized'),
+      category_group: String(ynabRecField(r, 'category_group') || 'Uncategorized'),
+      memo: String(ynabRecField(r, 'memo') || ''),
+      account: String(ynabRecField(r, 'account') || ''),
+      cleared: String(ynabRecField(r, 'cleared') || ''),
+      type,
+      is_split: false,
+    });
+  }
+  if (!out.length && (records || []).length) {
+    try { console.warn('[YNAB] collection rows present but none parsed', { total: records.length, skipped }); } catch (_) {}
+  }
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2858,17 +760,17 @@ function bucketData(txns, refDate, period, compare, showAvg) {
       const d = new Date(refDate); d.setDate(d.getDate() - i);
       const k = dateStr(d);
       labels.push(k.slice(5).replace('-', '.'));
-      cur.push(income.filter(t => t.date === k).reduce((a, t) => a + t.amount, 0));
+      cur.push(income.filter(t => ymd(t.date) === k).reduce((a, t) => a + t.amount, 0));
     }
-    curTotal = income.filter(t => t.date === dateStr(refDate)).reduce((a, t) => a + t.amount, 0);
+    curTotal = income.filter(t => ymd(t.date) === dateStr(refDate)).reduce((a, t) => a + t.amount, 0);
     if (compare) {
       prev = [];
       for (let i = N - 1; i >= 0; i--) {
         const d = new Date(refDate); d.setDate(d.getDate() - i - N);
-        prev.push(income.filter(t => t.date === dateStr(d)).reduce((a, t) => a + t.amount, 0));
+        prev.push(income.filter(t => ymd(t.date) === dateStr(d)).reduce((a, t) => a + t.amount, 0));
       }
       const yd = new Date(refDate); yd.setDate(yd.getDate() - 1);
-      prevTotal = income.filter(t => t.date === dateStr(yd)).reduce((a, t) => a + t.amount, 0);
+      prevTotal = income.filter(t => ymd(t.date) === dateStr(yd)).reduce((a, t) => a + t.amount, 0);
     }
     if (showAvg) avg = cur.reduce((a, b) => a + b, 0) / cur.length;
 
@@ -2886,22 +788,22 @@ function bucketData(txns, refDate, period, compare, showAvg) {
       })();
       const wkMMDD = dateStr(s).slice(5).replace('-', '.');
       labels.push(`w${String(wkNum).padStart(2,'0')} · ${wkMMDD}`);
-      cur.push(income.filter(t => t.date >= dateStr(s) && t.date <= dateStr(e)).reduce((a,t)=>a+t.amount,0));
+      cur.push(income.filter(t => inYmdRange(t.date, dateStr(s), dateStr(e))).reduce((a,t)=>a+t.amount,0));
     }
     const wse = new Date(ws); wse.setDate(wse.getDate()+6);
-    curTotal = income.filter(t => t.date >= dateStr(ws) && t.date <= dateStr(wse)).reduce((a,t)=>a+t.amount,0);
+    curTotal = income.filter(t => inYmdRange(t.date, dateStr(ws), dateStr(wse))).reduce((a,t)=>a+t.amount,0);
     if (compare) {
       // Overlay: each bar's comparison is the equivalent week 1 year ago
       // prevTotal: simply the week immediately before the current one
       const lastWS = new Date(ws); lastWS.setDate(lastWS.getDate() - 7);
       const lastWE = new Date(lastWS); lastWE.setDate(lastWE.getDate() + 6);
-      prevTotal = income.filter(t => t.date >= dateStr(lastWS) && t.date <= dateStr(lastWE)).reduce((a,t)=>a+t.amount,0);
+      prevTotal = income.filter(t => inYmdRange(t.date, dateStr(lastWS), dateStr(lastWE))).reduce((a,t)=>a+t.amount,0);
       // Overlay line: shift each displayed week back by exactly 1 week
       prev = [];
       for (let i = N - 1; i >= 0; i--) {
         const s = new Date(ws); s.setDate(s.getDate() - i*7 - 7);
         const e = new Date(s);  e.setDate(e.getDate()+6);
-        prev.push(income.filter(t => t.date >= dateStr(s) && t.date <= dateStr(e)).reduce((a,t)=>a+t.amount,0));
+        prev.push(income.filter(t => inYmdRange(t.date, dateStr(s), dateStr(e))).reduce((a,t)=>a+t.amount,0));
       }
     }
     if (showAvg) { const nz = cur.filter(v=>v>0); avg = nz.length ? nz.reduce((a,b)=>a+b,0)/nz.length : 0; }
@@ -2911,18 +813,18 @@ function bucketData(txns, refDate, period, compare, showAvg) {
     for (let i = N - 1; i >= 0; i--) {
       const d  = new Date(refDate.getFullYear(), refDate.getMonth()-i, 1);
       const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
-      labels.push(d.toLocaleString('default',{month:'short',year:'2-digit'}));
-      cur.push(income.filter(t=>t.date.startsWith(key)).reduce((a,t)=>a+t.amount,0));
+      labels.push(monthYearLabel(d));
+      cur.push(income.filter(t=>ymd(t.date).startsWith(key)).reduce((a,t)=>a+t.amount,0));
     }
     const ck = `${refDate.getFullYear()}-${String(refDate.getMonth()+1).padStart(2,'0')}`;
-    curTotal = income.filter(t=>t.date.startsWith(ck)).reduce((a,t)=>a+t.amount,0);
+    curTotal = income.filter(t=>ymd(t.date).startsWith(ck)).reduce((a,t)=>a+t.amount,0);
     if (compare) {
       const pd = new Date(refDate.getFullYear(), refDate.getMonth()-N, 1);
       prev = [];
       for (let i = 0; i < N; i++) {
         const d = new Date(pd.getFullYear(), pd.getMonth()+i, 1);
         const k = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
-        prev.push(income.filter(t=>t.date.startsWith(k)).reduce((a,t)=>a+t.amount,0));
+        prev.push(income.filter(t=>ymd(t.date).startsWith(k)).reduce((a,t)=>a+t.amount,0));
       }
       prevTotal = prev[prev.length-1] ?? 0;
     }
@@ -2937,7 +839,63 @@ function bucketData(txns, refDate, period, compare, showAvg) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CSS = `
-  /* ── Journal widget — bg matches Backreferences card exactly ── */
+  /* Inside JHS: no nested card (prod .jhs-body .ynab-widget). */
+  .dawn-jhs-shell .dawn-jhs-body .ynab-widget {
+    background: transparent !important;
+    border: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+  }
+  .dawn-jhs-header-extra .jhs-ynab-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .dawn-jhs-header-extra .jhs-ynab-controls-left {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .dawn-jhs-header-extra .jhs-ynab-controls-right {
+    display: flex;
+    align-items: center;
+    margin-left: auto;
+  }
+  .dawn-jhs-header-extra .ynab-tgroup {
+    background: transparent;
+    border-radius: 0;
+    padding: 0;
+    gap: 10px;
+  }
+  .dawn-jhs-header-extra .ynab-tgroup + .ynab-tgroup {
+    margin-left: 4px;
+    padding-left: 14px;
+    border-left: 1px solid rgba(255,255,255,0.075);
+  }
+  .dawn-jhs-header-extra .ynab-tbtn {
+    padding: 1px 0;
+    border-radius: 0;
+    background: transparent;
+    color: rgba(232, 224, 208, 0.5);
+    font-size: 11px;
+    letter-spacing: 0.015em;
+  }
+  .dawn-jhs-header-extra .ynab-tbtn:hover {
+    background: transparent;
+    color: rgba(232, 224, 208, 0.86);
+  }
+  .dawn-jhs-header-extra .ynab-tbtn.active {
+    background: transparent;
+    color: #3d8f58;
+    font-weight: 600;
+  }
+  /* ── Standalone / dashboard card ── */
   .ynab-widget {
     background-color: ${C.cardBg};
     border: 1px solid ${C.cardBorder};
@@ -3208,6 +1166,9 @@ const CSS = `
     letter-spacing: 0.07em; color: ${C.statLabel}; margin-bottom: 7px;
   }
   .ynab-dash-chart-wrap { position: relative; height: 180px; }
+  .ynab-dash-trends-controls {
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px;
+  }
 
   /* Tables */
   /* Secondary stat row (wages/draw) */
@@ -3257,9 +1218,9 @@ const CSS = `
   .ynab-badge.cleared { background: rgba(${C.greenRgb}, 0.15); color: #3d8f58; }
   .ynab-badge.reconciled { background: rgba(99,132,200,0.14); color: #7aacf8; }
 
-  /* Config dialog */
+  /* Config dialog — must stack above the floating dashboard (z-index 99998) */
   .ynab-overlay {
-    position: fixed; inset: 0; background: rgba(0,0,0,0.62); z-index: 9999;
+    position: fixed; inset: 0; background: rgba(0,0,0,0.62); z-index: 100050;
     display: flex; align-items: center; justify-content: center; backdrop-filter: blur(4px);
   }
   .ynab-dialog {
@@ -3280,9 +1241,9 @@ const CSS = `
   .ynab-dlg-status { font-size: 12px; color: ${C.statLabel}; min-height: 16px; }
   .ynab-dlg-btns { display: flex; justify-content: flex-end; gap: 8px; }
 
-  /* Settings modal */
+  /* Settings modal — above dashboard backdrop so Filter Settings is usable while dash is open */
   .ynab-settings-overlay {
-    position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 9999;
+    position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 100050;
     display: flex; align-items: center; justify-content: center;
     backdrop-filter: blur(4px);
   }
@@ -3442,22 +1403,66 @@ function _ynabStubViewMethods(view) {
   });
 }
 
-class Plugin extends AppPlugin {
+class DawnYnab {
+  constructor(app) {
+    this.ui = app.ui;
+    this.data = app.data;
+    this.events = app.events;
+    this._host = app;
+    this._ynabCollsKey = null;
+    this._ynabCollsResolved = false;
+    this._ynabTxnColl = null;
+    this._dashBackdrop = null;
+    this._dashRefreshTimer = null;
+    this._ynabUiCssInstalled = false;
+    this._ynabDashRenderGen = 0;
+  }
 
-  /** One `getAllCollections` per workspace after the YNAB collection is found (cleared on unload). */
-  _ynabCollsKey = null;
-  _ynabCollsResolved = false;
-  _ynabTxnColl = null;
-  _dashBackdrop = null;
-  _dashRefreshTimer = null;
-  /** `injectCSS` must run once — repeated calls (plugin reload) can thrash layout. */
-  _ynabUiCssInstalled = false;
-  /**
-   * Plugin Backend writes (e.g. Bilt Value Tracker `scheduleFlush`) cause Thymer to fire
-   * `onRefresh` on every open plugin panel. Without debounce, this re-runs the full YNAB
-   * dashboard (Chart.js + transaction load) in a tight loop → flicker + app freeze.
-   */
-  _ynabDashRenderGen = 0;
+  getConfiguration() {
+    try {
+      return this._host.getConfiguration?.() || {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  _ynabCollName(c) {
+    try { return String(c?.getName?.() || c?.name || '').trim(); } catch (_) { return ''; }
+  }
+
+  _ynabCollGuid(c) {
+    try { return String(c?.guid || c?.getGuid?.() || ''); } catch (_) { return ''; }
+  }
+
+  _isYnabTxnCollection(c) {
+    if (!c) return false;
+    const guid = this._ynabCollGuid(c);
+    if (guid && guid === YNAB_COLLECTION_GUID) return true;
+    return this._ynabCollName(c).toLowerCase() === YNAB_COLLECTION_NAME.toLowerCase();
+  }
+
+  async _listCollections() {
+    const boot = globalThis.BootKernel || globalThis.__dawnBoot;
+    let collections = [];
+    try {
+      if (boot?.getAllCollections) collections = (await boot.getAllCollections(this.data)) || [];
+    } catch (_) {}
+    if (!collections.length) {
+      try { collections = (await this.data.getAllCollections?.()) || []; } catch (_) {}
+    }
+    return collections || [];
+  }
+
+  async _findYnabTxnCollection() {
+    const list = await this._listCollections();
+    let coll = (list || []).find((c) => this._isYnabTxnCollection(c)) || null;
+    if (coll) return coll;
+    try {
+      coll = this.data.getPluginByGuid?.(YNAB_COLLECTION_GUID) || this.data.getCollection?.(YNAB_COLLECTION_GUID) || null;
+    } catch (_) { coll = null; }
+    if (this._isYnabTxnCollection(coll) || coll) return coll;
+    return null;
+  }
 
   async _ensureYnabTxnCollection() {
     let key = '';
@@ -3465,41 +1470,31 @@ class Plugin extends AppPlugin {
       key = String(this.data.getActiveUsers?.()?.[0]?.workspaceGuid || '');
     } catch (_) {}
     if (this._ynabCollsKey === key && this._ynabCollsResolved && this._ynabTxnColl) return this._ynabTxnColl;
-    const collections = await this.data.getAllCollections();
-    const coll = collections.find((c) => c.getName() === YNAB_COLLECTION_NAME) || null;
+    const coll = await this._findYnabTxnCollection();
     this._ynabTxnColl = coll;
     this._ynabCollsKey = key;
     this._ynabCollsResolved = !!coll;
     return coll;
   }
 
-  async onLoad() {
-    const diag = globalThis.__thymerDiag;
-    diag?.record?.('YNAB_ONLOAD_START');
-    if (diag?.isPanic?.()) {
-      diag.record('YNAB_ONLOAD_PANIC_SKIP');
-      return;
-    }
+  attach() {
     globalThis.__ynabPluginSettingsPlugin = this;
-    /**
-     * Journal income widget on daily pages. Default off (Journal Header Suite embeds YNAB).
-     * Set `custom.mount_journal_income_widget` to true in this collection’s config to mount the standalone widget.
-     */
-    const c = this.getConfiguration?.()?.custom;
-    const hasMountKey = c && Object.prototype.hasOwnProperty.call(c, 'mount_journal_income_widget');
-    this._mountJournalIncomeWidget = hasMountKey ? c.mount_journal_income_widget !== false : false;
     globalThis.__ynabBusinessPlugin = this;
     try {
-      const reg = globalThis.__thymerExtDashboardOpeners || (globalThis.__thymerExtDashboardOpeners = {});
-      reg['YNAB'] = { icon: 'ti-coin', open: () => { void this.openDashboardModal(); } };
+      globalThis.__dawnYnab = {
+        plugin: this,
+        incomeSummary: (dayKey) => this._dashIncomeSummary(dayKey),
+      };
     } catch (_) {}
+    this._mountJournalIncomeWidget = true;
     this._panelStates    = new Map();
     this._eventIds       = [];
     this._chartInstances = new Map();
     this._ynNavTimers    = new Map();
+    this._unregTab = null;
+    this._ynabPathBReadyPromise = null;
+    ynabCopyProdLsIfEmpty();
 
-    // Note: versioned cache keys (v4) mean old-format data auto-expires
-    // without needing to manually bust the cache on every load
     if (!this._ynabUiCssInstalled) {
       try {
         this.ui.injectCSS(CSS);
@@ -3508,76 +1503,264 @@ class Plugin extends AppPlugin {
         this._ynabUiCssInstalled = false;
       }
     }
+
     this._cmdOpenDash = this.ui.addCommandPaletteCommand({
       label: 'YNAB: Open dashboard', icon: 'ti-dashboard',
-      onSelected: () => { void this.openDashboardModal(); },
+      onSelected: () => void this.openDashboardModal(),
     });
-
-    this._eventIds.push(this.events.on('panel.navigated', ev => this._deferHandlePanel(ev.panel)));
-    this._eventIds.push(this.events.on('panel.focused',   ev => this._handlePanel(ev.panel)));
-    this._eventIds.push(this.events.on('panel.closed',    ev => this._disposePanel(ev.panel?.getId?.())));
-
     this._cmdSync = this.ui.addCommandPaletteCommand({
       label: 'YNAB: Sync Transactions Now', icon: 'ti-refresh',
-      onSelected: () => this._syncAll(true),
+      onSelected: () => void this._syncAll(true),
     });
     this._cmdCfg = this.ui.addCommandPaletteCommand({
       label: 'YNAB: Configure Token & Budget', icon: 'ti-settings',
-      onSelected: () => this._showConfigDialog(),
+      onSelected: () => void this._showConfigDialog(),
     });
-    this._cmdStorage = this.ui.addCommandPaletteCommand({
-      label: 'YNAB: Storage location…',
-      icon: 'ti-database',
-      onSelected: () => {
-        void this._ynabEnsurePathBReady().then(() => {
-          globalThis.ThymerPluginSettings?.openStorageDialog?.({
-          plugin: this,
-          pluginId: 'ynab',
-          modeKey: 'thymerext_ps_mode_ynab',
-          mirrorKeys: () => Object.values(SK),
+
+    this._waitForShell((shell) => {
+      try {
+        this._unregTab = (shell.registerTab || shell.registerAddon).call(shell, {
+          id: 'ynab',
           label: 'YNAB',
-          data: this.data,
-          ui: this.ui,
+          icon: 'ti-coin',
+          mode: 'inline',
+          order: 10,
+          mount: (el) => this._mountJhsTab(el),
+          onDay: (dayLabel, meta) => this._onJhsDay(dayLabel, meta || {}),
+          onExpand: (expanded) => {
+            this._syncJhsHeaderControls(!!expanded && this._jhsTabActive);
+            if (expanded) void this._populateJhsFromCache();
+          },
+          onTab: (active) => {
+            this._jhsTabActive = !!active;
+            this._syncJhsHeaderControls(!!active);
+            if (active) void this._populateJhsFromCache();
+          },
         });
-        });
-      },
+      } catch (e) {
+        console.warn('[Dawn/YNAB] registerTab', e);
+      }
     });
+  }
 
-    this._cmdJournalWidgetOn = this.ui.addCommandPaletteCommand({
-      label: 'YNAB: Enable standalone journal income widget',
-      icon: 'ti-chart-line',
-      onSelected: () => {
-        try { localStorage.setItem(YNAB_JWIDGET_OVERRIDE_LS, 'on'); } catch (_) {}
-        this._refreshJournalWidgetPanelsAfterOverrideChange();
-        this.ui.addToaster?.({ title: 'YNAB', message: 'Standalone journal widget enabled.', autoDestroyTime: 2200, dismissible: true });
-      },
-    });
-    this._cmdJournalWidgetOff = this.ui.addCommandPaletteCommand({
-      label: 'YNAB: Disable standalone journal income widget',
-      icon: 'ti-chart-line',
-      onSelected: () => {
-        try { localStorage.setItem(YNAB_JWIDGET_OVERRIDE_LS, 'off'); } catch (_) {}
-        this._refreshJournalWidgetPanelsAfterOverrideChange();
-        this.ui.addToaster?.({ title: 'YNAB', message: 'Standalone journal widget disabled.', autoDestroyTime: 2200, dismissible: true });
-      },
-    });
-    this._cmdJournalWidgetClear = this.ui.addCommandPaletteCommand({
-      label: 'YNAB: Clear journal widget override (use collection config)',
-      icon: 'ti-adjustments',
-      onSelected: () => {
-        try { localStorage.removeItem(YNAB_JWIDGET_OVERRIDE_LS); } catch (_) {}
-        this._refreshJournalWidgetPanelsAfterOverrideChange();
-        this.ui.addToaster?.({ title: 'YNAB', message: 'Journal widget follows collection config.', autoDestroyTime: 2200, dismissible: true });
-      },
-    });
+  _waitForShell(cb) {
+    let n = 0;
+    const tick = () => {
+      const shell = globalThis.__dawnJhsShell;
+      if (shell?.registerTab || shell?.registerAddon) {
+        cb(shell);
+        return;
+      }
+      n += 1;
+      if (n > 240) return;
+      setTimeout(tick, 40);
+    };
+    tick();
+  }
 
+  _parseDayKey(meta, dayLabel) {
+    const key = String(meta?.dayKey || '').trim();
+    let m = key.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!m) {
+      const raw = String(dayLabel || '').replace(/\D/g, '');
+      if (raw.length >= 8) m = [null, raw.slice(0, 4), raw.slice(4, 6), raw.slice(6, 8)];
+    }
+    if (!m) {
+      const d = new Date();
+      return {
+        year: d.getFullYear(),
+        month: d.getMonth() + 1,
+        day: d.getDate(),
+        yyyymmdd: `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`,
+      };
+    }
+    return {
+      year: +m[1],
+      month: +m[2],
+      day: +m[3],
+      yyyymmdd: `${m[1]}${m[2]}${m[3]}`,
+    };
+  }
+
+  _mountJhsTab(el) {
+    this._jhsHost = el;
+    if (!el) return;
+    el.innerHTML = '';
+    const jd = this._jhsDay || this._parseDayKey({}, null);
+    const state = {
+      panelId: 'jhs',
+      panel: null,
+      recordGuid: null,
+      ...jd,
+      rootEl: null,
+      observer: null,
+      loaded: false,
+      loading: false,
+      _pendingPopulateWidget: false,
+    };
+    this._panelStates.set('jhs', state);
+    state.rootEl = this._buildJhsWidget(state);
+    el.appendChild(state.rootEl);
+    this._jhsTabActive = true;
+    this._syncJhsHeaderControls(true);
+    void this._populateJhsFromCache();
+  }
+
+  _buildJhsWidget(state) {
+    const root = document.createElement('div');
+    root.className = 'ynab-widget';
+    root.dataset.panelId = state.panelId;
+    const body = document.createElement('div');
+    body.className = 'ynab-widget-body';
+    const statRow = document.createElement('div');
+    statRow.className = 'ynab-stat-row';
+    statRow.dataset.role = 'stats';
+    const canvasWrap = document.createElement('div');
+    canvasWrap.className = 'ynab-canvas-wrap';
+    const canvas = document.createElement('canvas');
+    canvas.dataset.role = 'chart';
+    canvas.height = 140;
+    canvasWrap.appendChild(canvas);
+    const statusEl = document.createElement('div');
+    statusEl.className = 'ynab-status';
+    statusEl.dataset.role = 'status';
+    body.append(statRow, canvasWrap, statusEl);
+    const cfgHost = document.createElement('div');
+    cfgHost.dataset.role = 'ynab-cfg-host';
+    body.appendChild(cfgHost);
+    root.appendChild(body);
+    this._paintJhsCfgPrompt(state);
+    return root;
+  }
+
+  _ynabIsConfigured() {
+    return !!(ls(SK.TOKEN) && ls(SK.BUDGET_ID));
+  }
+
+  _paintJhsCfgPrompt(state) {
+    const host = state?.rootEl?.querySelector?.('[data-role="ynab-cfg-host"]');
+    if (!host) return;
+    host.innerHTML = '';
+    if (this._ynabIsConfigured()) {
+      host.hidden = true;
+      return;
+    }
+    host.hidden = false;
+    host.appendChild(this._cfgPrompt());
+  }
+
+  _syncJhsHeaderControls(visible) {
+    const shell = globalThis.__dawnJhsShell;
+    const host = shell?.getHeaderExtra?.();
+    if (!host) return;
+    if (!visible) {
+      host.innerHTML = '';
+      try {
+        shell.syncHeaderExtra?.();
+      } catch (_) {}
+      return;
+    }
+    const state = this._panelStates.get('jhs');
+    if (!state) return;
+    host.innerHTML = '';
+    const wrap = document.createElement('div');
+    wrap.className = 'jhs-ynab-controls';
+    const period = ls(SK.WIDGET_PERIOD) || 'weekly';
+    const ctype = ls(SK.WIDGET_CHART) || 'bar';
+    const left = document.createElement('div');
+    left.className = 'jhs-ynab-controls-left';
+    left.append(
+      this._tgroup(
+        [
+          ['daily', 'Daily'],
+          ['weekly', 'Weekly'],
+          ['monthly', 'Monthly'],
+        ],
+        SK.WIDGET_PERIOD,
+        period,
+        () => this._populateWidget(this._panelStates.get('jhs'))
+      ),
+      this._tgroup(
+        [
+          ['bar', '▊ Bar'],
+          ['line', '╱ Line'],
+        ],
+        SK.WIDGET_CHART,
+        ctype,
+        () => this._populateWidget(this._panelStates.get('jhs'))
+      )
+    );
+    const right = document.createElement('div');
+    right.className = 'jhs-ynab-controls-right';
+    right.append(this._optGroup(state));
+    wrap.append(left, right);
+    host.appendChild(wrap);
     try {
-      const p0 = this.ui.getActivePanel();
-      if (p0) requestAnimationFrame(() => this._handlePanel(p0));
+      shell.syncHeaderExtra?.();
     } catch (_) {}
-    setTimeout(() => { const p = this.ui.getActivePanel(); if (p) this._handlePanel(p); }, 120);
-    // No auto-sync on load — sync is manual only (avoids freezing on large budgets)
-    diag?.record?.('YNAB_ONLOAD_END');
+  }
+
+  _dashIncomeSummary(dayKey) {
+    const raw = lsJson(SK.CACHE_TXN, null);
+    const txns = Array.isArray(raw)
+      ? raw.map((t) => (t && t.date ? { ...t, date: ymd(t.date) } : t))
+      : [];
+    const income = txns.filter((t) => isIncomeTransaction(t, txns));
+    const m = String(dayKey || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+    const ref = m
+      ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 12, 0, 0)
+      : new Date();
+    const money = (n) => {
+      const v = Number(n) || 0;
+      const sign = v < 0 ? '-' : '';
+      return `${sign}$${Math.abs(v).toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
+    };
+    const vs = (cur, prev) => {
+      if (prev == null || !Number.isFinite(prev)) return '—';
+      const d = cur - prev;
+      const sign = d > 0 ? '+' : '';
+      return `${sign}${money(d)} vs last`;
+    };
+    const daily = bucketData(income, ref, 'daily', true, true);
+    const weekly = bucketData(income, ref, 'weekly', true, true);
+    const monthly = bucketData(income, ref, 'monthly', true, true);
+    return {
+      today: {
+        label: 'Today',
+        total: daily.curTotal || 0,
+        avg: daily.avg || 0,
+        vs: vs(daily.curTotal || 0, daily.prevTotal),
+      },
+      week: {
+        label: 'This week',
+        total: weekly.curTotal || 0,
+        avg: weekly.avg || 0,
+        vs: vs(weekly.curTotal || 0, weekly.prevTotal),
+      },
+      month: {
+        label: 'This month',
+        total: monthly.curTotal || 0,
+        avg: monthly.avg || 0,
+        vs: vs(monthly.curTotal || 0, monthly.prevTotal),
+      },
+    };
+  }
+
+  _onJhsDay(dayLabel, meta) {
+    this._jhsDay = this._parseDayKey(meta, dayLabel);
+    const state = this._panelStates.get('jhs');
+    if (!state) return;
+    Object.assign(state, this._jhsDay);
+    // Cache paint only — Chart.js / API stay on expand / tab.
+  }
+
+  async _populateJhsFromCache() {
+    void this._ynabEnsurePathBReady();
+    const state = this._panelStates.get('jhs');
+    if (!state?.rootEl) return;
+    if (this._jhsDay) Object.assign(state, this._jhsDay);
+    this._paintJhsCfgPrompt(state);
+    await this._populateWidget(state);
   }
 
   _ynabEnsurePathBReady() {
@@ -3588,41 +1771,49 @@ class Plugin extends AppPlugin {
 
   async _ynabRunDeferredPathB() {
     try {
-      await (globalThis.ThymerPluginSettings?.yieldToHostBeforePathB?.() ?? new Promise((r) => {
-        try {
-          if (typeof requestIdleCallback === 'function') {
-            requestIdleCallback(() => r(), { timeout: 5000 });
-          } else {
-            setTimeout(r, 900);
-          }
-        } catch (_) {
-          setTimeout(r, 900);
-        }
-      }));
-      await (globalThis.ThymerPluginSettings?.init?.({
-        plugin: this,
+      const api = globalThis.ThymerPluginSettings;
+      if (!api?.init || (api.__pathBStub && !api.__dawnPathBHost)) {
+        ynabCopyProdLsIfEmpty();
+        return;
+      }
+      await api.init({
+        plugin: this._host || this,
         pluginId: 'ynab',
-        modeKey: 'thymerext_ps_mode_ynab',
-        mirrorKeys: () => Object.values(SK),
         label: 'YNAB',
         data: this.data,
         ui: this.ui,
-      }) ?? (console.warn('[YNAB] ThymerPluginSettings runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
+        mirrorKeys: SK_PATHB_MIRROR,
+        awaitHydrate: false,
+        onHydrated: () => {
+          ynabCopyProdLsIfEmpty();
+          this._paintJhsCfgPrompt(this._panelStates.get('jhs'));
+          void this._populateJhsFromCache();
+        },
+      });
+      const host = this._host || this;
+      host._pluginSettingsPluginId = 'ynab';
+      host._pluginSettingsSyncMode = 'synced';
+      this._pluginSettingsPluginId = 'ynab';
+      this._pluginSettingsSyncMode = 'synced';
     } catch (e) {
       try {
-        console.warn('[YNAB] deferred Path B init', e);
+        console.warn('[YNAB] Path B init', e);
       } catch (_) {}
     }
+    ynabCopyProdLsIfEmpty();
   }
 
-  onUnload() {
+  detach() {
     if (globalThis.__ynabBusinessPlugin === this) globalThis.__ynabBusinessPlugin = undefined;
     if (globalThis.__ynabPluginSettingsPlugin === this) globalThis.__ynabPluginSettingsPlugin = undefined;
-    this._closeDashboardModal();
     try {
-      const reg = globalThis.__thymerExtDashboardOpeners;
-      if (reg && reg['YNAB']) delete reg['YNAB'];
+      if (globalThis.__dawnYnab?.plugin === this) globalThis.__dawnYnab = undefined;
     } catch (_) {}
+    this._closeDashboardModal();
+    try { this._unregTab?.(); } catch (_) {}
+    this._unregTab = null;
+    this._jhsTabActive = false;
+    this._syncJhsHeaderControls(false);
     this._ynabUiCssInstalled = false;
     this._ynabCollsKey = null;
     this._ynabCollsResolved = false;
@@ -3645,6 +1836,18 @@ class Plugin extends AppPlugin {
     this._chartInstances?.clear();
   }
 
+  /**
+   * Prefer YNAB collection rows (what the Income vs Expenses view shows). Fall back
+   * to API cache / live fetch when the collection is empty or unreadable.
+   */
+  async _loadDashTxns(forceApi = false) {
+    // Dawn: LS/API cache only — never getAllRecords the YNAB collection on open.
+    if (!forceApi && this._lastSyncTxns?.length) return this._lastSyncTxns;
+    const apiTxns = await getTransactions(!!forceApi);
+    this._lastSyncTxns = apiTxns;
+    return apiTxns;
+  }
+
   // ── Dashboard view ──────────────────────────────────────────────────────────
 
   _closeDashboardModal() {
@@ -3660,7 +1863,7 @@ class Plugin extends AppPlugin {
 
   async openDashboardModal() {
     if (this._dashBackdrop) return;
-    await this._ynabEnsurePathBReady();
+    void this._ynabEnsurePathBReady();
     globalThis.__thymerDiag?.record?.('YNAB_PANEL_OPEN');
     const self = this;
     const backdrop = document.createElement('div');
@@ -3749,7 +1952,7 @@ class Plugin extends AppPlugin {
         const loadEl = container.querySelector('.ynab-dash-loading');
         if (loadEl) loadEl.textContent = 'Loading transactions…';
       }
-      const txns = await getTransactions();
+      const txns = await this._loadDashTxns(false);
       if (gen !== this._ynabDashRenderGen) return;
       /**
        * One more “user editing?” check right before the swap — `_renderDash` may
@@ -3784,9 +1987,15 @@ class Plugin extends AppPlugin {
 
   _buildDash(allTxns) {
     const now = new Date();
-    const thisMonthPreset = presets()[0];
-    const fromVal = ls(SK.DASH_FROM) || thisMonthPreset.from;
+    const oldest = oldestTxnYmd(allTxns);
+    const thisMonthPreset = presets(oldest)[0];
+    let fromVal = ls(SK.DASH_FROM) || thisMonthPreset.from;
     const toVal   = ls(SK.DASH_TO)   || thisMonthPreset.to;
+    // Migrate stale "All Time" epochs (e.g. 2000-01-01) to the real oldest txn.
+    if (oldest && fromVal && fromVal < oldest) {
+      fromVal = oldest;
+      lsSet(SK.DASH_FROM, fromVal);
+    }
 
     const wrap = document.createElement('div');
     wrap.className = 'ynab-dash';
@@ -3804,7 +2013,7 @@ class Plugin extends AppPlugin {
     customRange.append(fromInput, rangeSep, toInput);
 
     let activePreset = null;
-    const ps = presets();
+    const ps = presets(oldest);
     for (const p of ps) { if (p.from===fromVal && p.to===toVal) { activePreset=p.label; break; } }
 
     const applyPreset = (p) => {
@@ -3861,7 +2070,9 @@ class Plugin extends AppPlugin {
       const allIncomePayers = [...new Set(allTxns.filter(t=>t.type==='income').map(t=>t.payee))];
       const inclCount = raw ? JSON.parse(raw).length : allIncomePayers.filter(p=>!['transfer','starting'].some(kw=>p.toLowerCase().includes(kw))).length;
       const exclGroups = lsJson(SK.EXCLUDED_GROUPS, DEFAULT_EXCLUDED);
-      filterSummaryEl.textContent = `${inclCount} income payees · ${exclGroups.length} expense groups excluded`;
+      const from = ymd(fromInput.value), to = ymd(toInput.value);
+      const inRange = allTxns.filter(t => inYmdRange(t.date, from, to)).length;
+      filterSummaryEl.textContent = `${allTxns.length} txns loaded · ${inRange} in range · ${inclCount} income payees · ${exclGroups.length} expense groups excluded`;
     };
     updateFilterSummary();
     gearBtn.addEventListener('click', () => {
@@ -3876,27 +2087,158 @@ class Plugin extends AppPlugin {
     const secondaryEl=document.createElement('div'); secondaryEl.className='ynab-secondary-row';
     wrap.appendChild(secondaryEl);
 
-    // ── Chart ──
-    const chartSection=document.createElement('div');
-    const chartTitle=document.createElement('div'); chartTitle.className='ynab-section-title';
-    const chartWrap=document.createElement('div'); chartWrap.className='ynab-dash-chart-wrap';
-    const canvas=document.createElement('canvas'); chartWrap.appendChild(canvas);
-    chartSection.append(chartTitle, chartWrap);
+    // ── Single cashflow chart (period / avg / compare + income & expenses) ──
+    const chartSection = document.createElement('div');
+    const chartTitle = document.createElement('div');
+    chartTitle.className = 'ynab-section-title';
+    const chartControls = document.createElement('div');
+    chartControls.className = 'ynab-dash-trends-controls';
+    const chartChips = document.createElement('div');
+    chartChips.className = 'ynab-stat-row';
+    const chartWrap = document.createElement('div');
+    chartWrap.className = 'ynab-dash-chart-wrap';
+    const canvas = document.createElement('canvas');
+    chartWrap.appendChild(canvas);
+    chartSection.append(chartTitle, chartControls, chartChips, chartWrap);
     wrap.appendChild(chartSection);
+
+    const period0 = ls(SK.WIDGET_PERIOD) || 'weekly';
+    const ctype0 = ls(SK.WIDGET_CHART) || 'bar';
+    const refreshChartOnly = () => { rebuildChart(); };
+    chartControls.append(
+      this._tgroup([['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly']], SK.WIDGET_PERIOD, period0, refreshChartOnly),
+      this._tgroup([['bar', '▊ Bar'], ['line', '╱ Line']], SK.WIDGET_CHART, ctype0, refreshChartOnly),
+      (() => {
+        const g = document.createElement('div');
+        g.className = 'ynab-tgroup';
+        g.append(
+          this._optBtn('⇄ vs Last', SK.WIDGET_COMPARE, refreshChartOnly),
+          this._optBtn('~ Avg', SK.WIDGET_AVG, refreshChartOnly),
+        );
+        return g;
+      })(),
+    );
 
     // ── Group totals ──
     const groupWrap=document.createElement('div'); wrap.appendChild(groupWrap);
 
     let dashChart=null;
     const taxesRef = { fn: null }; // ref to rebuildTaxes, set after declaration
+    const self = this;
+
+    const rebuildChart = () => {
+      const from = ymd(fromInput.value), to = ymd(toInput.value);
+      const ex = lsJson(SK.EXCLUDED_GROUPS, DEFAULT_EXCLUDED);
+      const isIncluded = t => isIncomeTransaction(t, allTxns);
+      const rangeTxns = allTxns.filter(t => inYmdRange(t.date, from, to));
+      const period = ls(SK.WIDGET_PERIOD) || 'weekly';
+      const compare = ls(SK.WIDGET_COMPARE) === 'true';
+      const showAvg = ls(SK.WIDGET_AVG) === 'true';
+      const ctype = ls(SK.WIDGET_CHART) || 'bar';
+
+      const { keys, labels, grain, windowNote } = buildRangeBuckets(from, to, period);
+      const preferLabel = ({ daily: 'Daily', weekly: 'Weekly', monthly: 'Monthly' })[period] || 'Monthly';
+      const grainLabel = ({ day: 'Daily', week: 'Weekly', month: 'Monthly', quarter: 'Quarterly', year: 'Yearly' })[grain] || preferLabel;
+      const incByBucket = keys.map(k => rangeTxns.filter(t => isIncluded(t) && txnInRangeBucket(t, k, grain)).reduce((a, t) => a + t.amount, 0));
+      const expByBucket = keys.map(k => rangeTxns.filter(t => t.type === 'expense' && !ex.includes(t.category_group) && txnInRangeBucket(t, k, grain)).reduce((a, t) => a + Math.abs(t.amount), 0));
+
+      // Journal-style chips for the active period window (relative to range end)
+      const incomeTxns = allTxns.filter(t => isIncluded(t));
+      const refRaw = to || dateStr(new Date());
+      const refDate = new Date(`${refRaw}T12:00:00`);
+      const safeRef = Number.isNaN(refDate.getTime()) ? new Date() : refDate;
+      const { curTotal, prevTotal, avg } = bucketData(incomeTxns, safeRef, period, compare, showAvg);
+
+      chartChips.innerHTML = '';
+      const toIsToday = refRaw === dateStr(new Date());
+      const pl = {
+        daily: toIsToday ? 'Today' : 'End day',
+        weekly: 'End week',
+        monthly: 'End month',
+      }[period];
+      chartChips.appendChild(self._chip(pl + ' Income', curTotal));
+      if (compare && prevTotal !== null) {
+        const diff = curTotal - prevTotal;
+        chartChips.append(self._chip('vs Last', prevTotal), self._chip('Δ', diff, diff >= 0 ? 'pos' : 'neg'));
+      }
+      if (showAvg && avg !== null) chartChips.appendChild(self._chip('Avg', avg));
+
+      // Prior-year income overlay when Compare is on (same buckets, shifted −1 year)
+      let prevInc = null;
+      if (compare) {
+        prevInc = keys.map((k) => allTxns.filter((t) => {
+          if (!isIncluded(t) || !ymd(t.date)) return false;
+          const d0 = ymd(t.date);
+          const y = parseInt(d0.slice(0, 4), 10);
+          if (!Number.isFinite(y)) return false;
+          const asNextYear = `${y + 1}${d0.slice(4)}`;
+          return asNextYear >= from && asNextYear <= to && txnInRangeBucket({ date: asNextYear }, k, grain);
+        }).reduce((a, t) => a + t.amount, 0));
+      }
+
+      const nzInc = incByBucket.filter(v => v > 0);
+      const avgLine = showAvg && nzInc.length ? nzInc.reduce((a, b) => a + b, 0) / nzInc.length : (showAvg ? 0 : null);
+
+      const titleGrain = windowNote ? `${preferLabel} · ${windowNote}` : grainLabel;
+      chartTitle.textContent = `Income & Expenses (${titleGrain}) — ${from} → ${to}`;
+      if (dashChart) { try { dashChart.destroy(); } catch {} }
+
+      const greenFill = ctype === 'line' ? `rgba(${C.greenRgb}, 0.12)` : `rgba(${C.greenRgb}, 0.75)`;
+      const redFill = ctype === 'line' ? 'rgba(184,64,64,0.12)' : 'rgba(184,64,64,0.55)';
+      const datasets = [
+        {
+          label: 'Income', data: incByBucket,
+          backgroundColor: greenFill, borderColor: C.green, borderWidth: ctype === 'bar' ? 1 : 2,
+          tension: 0.35, fill: ctype === 'line',
+          pointRadius: ctype === 'line' ? 2 : 0, pointBackgroundColor: C.green,
+          type: ctype,
+        },
+        {
+          label: 'Expenses', data: expByBucket,
+          backgroundColor: redFill, borderColor: '#b84040', borderWidth: ctype === 'bar' ? 1 : 2,
+          tension: 0.35, fill: ctype === 'line',
+          pointRadius: ctype === 'line' ? 2 : 0, pointBackgroundColor: '#b84040',
+          type: ctype,
+        },
+      ];
+      if (compare && prevInc) {
+        datasets.push({
+          label: 'Income −1y', data: prevInc, type: 'line',
+          backgroundColor: 'transparent', borderColor: C.prevLine, borderWidth: 1.4,
+          borderDash: [4, 4], tension: 0.35, fill: false, pointRadius: 0,
+        });
+      }
+      if (showAvg && avgLine !== null) {
+        datasets.push({
+          label: 'Avg Income', data: Array(labels.length).fill(avgLine), type: 'line',
+          borderColor: C.avgLine, borderWidth: 1.2, borderDash: [5, 3], pointRadius: 0, fill: false,
+        });
+      }
+
+      dashChart = new window.Chart(canvas, {
+        type: ctype,
+        data: { labels, datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false, animation: { duration: 200 },
+          plugins: {
+            legend: { labels: { color: C.axisText, font: { size: 10 }, boxWidth: 14 } },
+            tooltip: { callbacks: { label: c => `${c.dataset.label}: ${fmt(c.parsed.y)}` } },
+          },
+          scales: {
+            x: { ticks: { color: C.axisText, font: { size: 10 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 18 }, grid: { color: 'rgba(255,255,255,0.04)' } },
+            y: { ticks: { color: C.axisText, font: { size: 10 }, callback: v => `$${v}` }, grid: { color: 'rgba(255,255,255,0.04)' }, beginAtZero: true },
+          },
+        },
+      });
+    };
 
     const rebuild = () => {
-      const from=fromInput.value, to=toInput.value;
+      const from=ymd(fromInput.value), to=ymd(toInput.value);
       const ex=lsJson(SK.EXCLUDED_GROUPS,DEFAULT_EXCLUDED);
 
       const isIncluded = t => isIncomeTransaction(t, allTxns);
 
-      const rangeTxns   = allTxns.filter(t=>t.date>=from && t.date<=to);
+      const rangeTxns   = allTxns.filter(t=>inYmdRange(t.date, from, to));
       const incomeAmt   = rangeTxns.filter(t=>isIncluded(t)).reduce((a,t)=>a+t.amount,0);
       const expenseAmt  = rangeTxns.filter(t=>t.type==='expense' && !ex.includes(t.category_group)).reduce((a,t)=>a+Math.abs(t.amount),0);
       const net         = incomeAmt - expenseAmt;
@@ -3932,32 +2274,7 @@ class Plugin extends AppPlugin {
         if (drawAmt  > 0) secondaryEl.appendChild(makeChip("Owner's Draw", drawAmt));
       }
 
-      // Chart — monthly income and expenses for the range
-      const fromDate=new Date(from+'T12:00:00'), toDate=new Date(to+'T12:00:00');
-      const months=[];
-      const d=new Date(fromDate.getFullYear(), fromDate.getMonth(), 1);
-      while (d<=toDate) { months.push(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`); d.setMonth(d.getMonth()+1); }
-      const incByMonth  = months.map(k=>rangeTxns.filter(t=>isIncluded(t) && t.date.startsWith(k)).reduce((a,t)=>a+t.amount,0));
-      const expByMonth  = months.map(k=>rangeTxns.filter(t=>t.type==='expense' && !ex.includes(t.category_group) && t.date.startsWith(k)).reduce((a,t)=>a+Math.abs(t.amount),0));
-      const mLabels     = months.map(k=>{ const [y,mo]=k.split('-'); return new Date(y,mo-1,1).toLocaleString('default',{month:'short',year:'2-digit'}); });
-
-      chartTitle.textContent=`Income & Expenses — ${from} → ${to}`;
-      if (dashChart) { try { dashChart.destroy(); } catch {} }
-      dashChart=new window.Chart(canvas, {
-        type:'bar',
-        data:{ labels:mLabels, datasets:[
-          { label:'Income',   data:incByMonth,  backgroundColor:`rgba(${C.greenRgb},0.75)`, borderColor:C.green,     borderWidth:1 },
-          { label:'Expenses', data:expByMonth, backgroundColor:'rgba(184,64,64,0.55)',        borderColor:'#b84040', borderWidth:1 },
-        ]},
-        options:{
-          responsive:true, maintainAspectRatio:false, animation:{duration:200},
-          plugins:{ legend:{labels:{color:C.axisText,font:{size:10},boxWidth:14}} },
-          scales:{
-            x:{ticks:{color:C.axisText,font:{size:10}},grid:{color:'rgba(255,255,255,0.04)'}},
-            y:{ticks:{color:C.axisText,font:{size:10},callback:v=>`$${v}`},grid:{color:'rgba(255,255,255,0.04)'},beginAtZero:true},
-          },
-        },
-      });
+      rebuildChart();
 
       // Group totals — income by payee, expenses by group
       groupWrap.innerHTML='';
@@ -4036,7 +2353,7 @@ class Plugin extends AppPlugin {
       const taxTxns = allTxns.filter(t =>
         t.type === 'expense' &&
         /taxes?/i.test(t.category_group) &&
-        t.date >= tf && t.date <= tt
+        inYmdRange(t.date, tf, tt)
       );
       const total = taxTxns.reduce((a,t) => a + Math.abs(t.amount), 0);
       taxesTotalEl.textContent = fmt(total);
@@ -4062,7 +2379,7 @@ class Plugin extends AppPlugin {
 
     const taxesExportHandler = () => {
       const tf=fromInput.value, tt=toInput.value;
-      const taxTxns = allTxns.filter(t=>t.type==='expense' && /taxes?/i.test(t.category_group) && t.date>=tf && t.date<=tt);
+      const taxTxns = allTxns.filter(t=>t.type==='expense' && /taxes?/i.test(t.category_group) && inYmdRange(t.date, tf, tt));
       const rows = [['Date','Payee','Category','Amount','Memo','Period']];
       for (const t of taxTxns.sort((a,b)=>b.date.localeCompare(a.date))) {
         rows.push([t.date, t.payee, t.category, Math.abs(t.amount).toFixed(2), t.memo, `${tf} to ${tt}`]);
@@ -4548,7 +2865,7 @@ class Plugin extends AppPlugin {
   // per batch — instead of one getAllRecords() per record (which froze at scale).
 
   async _syncAll(force = false) {
-    await this._ynabEnsurePathBReady();
+    void this._ynabEnsurePathBReady();
     const token = ls(SK.TOKEN), budgetId = ls(SK.BUDGET_ID);
     if (!token || !budgetId) {
       this.ui.addToaster({title:'YNAB',message:'Configure token first',dismissible:true,autoDestroyTime:5000});
@@ -4557,9 +2874,9 @@ class Plugin extends AppPlugin {
     try {
       this.ui.addToaster({title:'YNAB',message:'Fetching transactions…',dismissible:false,autoDestroyTime:3000});
       const txns = await getTransactions(force);
+      this._lastSyncTxns = txns;
 
-      const collections = await this.data.getAllCollections();
-      const coll = collections.find(c => c.getName() === YNAB_COLLECTION_NAME);
+      const coll = await this._findYnabTxnCollection();
       if (!coll) {
         this.ui.addToaster({title:'YNAB',message:`Collection "${YNAB_COLLECTION_NAME}" not found.`,dismissible:true,autoDestroyTime:5000});
         return;
@@ -4669,7 +2986,7 @@ class Plugin extends AppPlugin {
   _exportCSV(allTxns, from, to, excluded) {
     // Format matches the spreadsheet layout: Income by payee, Expenses by category group
     // Income filter uses the same payee inclusion list as the dashboard
-    const rangeTxns = allTxns.filter(t => t.date >= from && t.date <= to);
+    const rangeTxns = allTxns.filter(t => inYmdRange(t.date, from, to));
 
     // Income by payee (filtered using current payee settings)
     const payeeMap = {};
@@ -4749,6 +3066,8 @@ class Plugin extends AppPlugin {
 
     // ── DOM ──
     const overlay = document.createElement('div'); overlay.className='ynab-settings-overlay';
+    // Inline z-index so this stays above the floating dash even if CSS inject was skipped on hot reload.
+    overlay.style.zIndex = '100050';
     const modal   = document.createElement('div'); modal.className='ynab-settings-modal';
 
     // Header
@@ -4867,8 +3186,18 @@ class Plugin extends AppPlugin {
   // ── Config dialog ───────────────────────────────────────────────────────────
 
   async _showConfigDialog() {
-    await this._ynabEnsurePathBReady();
+    void this._ynabEnsurePathBReady();
+    this.ui.addToaster?.({
+      title: 'YNAB',
+      message: 'Opening configure…',
+      dismissible: true,
+      autoDestroyTime: 1600,
+    });
+    try {
+      document.querySelectorAll('.ynab-overlay').forEach((n) => n.remove());
+    } catch (_) {}
     const overlay = document.createElement('div'); overlay.className='ynab-overlay';
+    overlay.style.zIndex = '100050';
     const dialog  = document.createElement('div'); dialog.className='ynab-dialog';
 
     const title   = document.createElement('div'); title.className='ynab-dlg-title'; title.textContent='⚙️ YNAB Configuration';
