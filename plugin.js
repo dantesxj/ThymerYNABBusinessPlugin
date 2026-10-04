@@ -105,6 +105,7 @@ const SK = {
   CACHE_CATS:      'dawn:ynab_cats_v4',
   CACHE_CATS_TS:   'dawn:ynab_cats_ts_v4',
   CACHE_TS:        'dawn:ynab_txn_cache_ts',
+  RATE_LIMIT_UNTIL:'dawn:ynab_rate_limit_until',
   EXCLUDED_GROUPS: 'dawn:ynab_excluded_groups',
   WIDGET_PERIOD:   'dawn:ynab_widget_period',
   WIDGET_CHART:    'dawn:ynab_widget_chart',
@@ -119,7 +120,7 @@ const SK = {
 
 /** Keys synced via Plugin Backend. Cache blobs stay local — vault round-trips were
  *  overwriting fresher API caches with stale snapshots (e.g. missing July 2025). */
-const SK_CACHE_KEYS = new Set([SK.CACHE_TXN, SK.CACHE_CATS, SK.CACHE_CATS_TS, SK.CACHE_TS]);
+const SK_CACHE_KEYS = new Set([SK.CACHE_TXN, SK.CACHE_CATS, SK.CACHE_CATS_TS, SK.CACHE_TS, SK.RATE_LIMIT_UNTIL]);
 const SK_PROD_KEY = (dawnKey) => (String(dawnKey).startsWith('dawn:') ? dawnKey.slice(5) : dawnKey);
 const SK_PATHB_MIRROR = () => {
   const dawn = Object.values(SK).filter((k) => !SK_CACHE_KEYS.has(k));
@@ -489,14 +490,24 @@ function presets(oldestYmd) {
 // Uses the explicit payee include list if configured, else falls back to
 // excluding payees that contain "transfer" or "starting".
 function isIncomeTransaction(t, allTxns) {
-  if (t.type !== 'income') return false;
+  // Align with Dashboard trail: treat positive amounts without type as income.
+  const typ = String(t?.type || '').toLowerCase();
+  const amt = Number(t?.amount);
+  const looksIncome = typ === 'income' || (!typ && Number.isFinite(amt) && amt > 0);
+  if (!looksIncome) return false;
+  const payee = String(t.payee || '').toLowerCase();
   const raw = ls(SK.INCL_PAYEES);
   if (raw) {
-    const incl = JSON.parse(raw).map((p) => String(p).trim().toLowerCase());
-    return incl.includes(String(t.payee || '').trim().toLowerCase());
+    try {
+      const incl = JSON.parse(raw)
+        .map((p) => String(p).trim().toLowerCase())
+        .filter(Boolean);
+      // Empty include list = misconfigured filter → fall through to default
+      if (incl.length) return incl.includes(payee.trim());
+    } catch (_) {}
   }
   // Default: exclude transfer-like payees
-  return !['transfer','starting'].some(kw => t.payee.toLowerCase().includes(kw));
+  return !['transfer', 'starting'].some((kw) => payee.includes(kw));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -505,12 +516,21 @@ function isIncomeTransaction(t, allTxns) {
 
 let _chartLoad = null;
 function loadChartJs() {
-  if (window.Chart) return Promise.resolve();
+  if (window.Chart) return Promise.resolve(window.Chart);
   if (_chartLoad) return _chartLoad;
-  _chartLoad = new Promise((res, rej) => {
-    const s = document.createElement('script');
-    s.src = CHART_JS_URL; s.onload = res; s.onerror = rej;
-    document.head.appendChild(s);
+  _chartLoad = ynabWithTimeout(
+    new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = CHART_JS_URL;
+      s.onload = () => (window.Chart ? res(window.Chart) : rej(new Error('Chart.js missing')));
+      s.onerror = () => rej(new Error('Chart.js failed to load'));
+      document.head.appendChild(s);
+    }),
+    12000,
+    'Chart.js'
+  ).catch((e) => {
+    _chartLoad = null;
+    throw e;
   });
   return _chartLoad;
 }
@@ -525,7 +545,15 @@ async function ynabGet(path, token) {
   });
   if (!r.ok) {
     const e = await r.json().catch(() => ({}));
-    throw new Error(e?.error?.detail || `YNAB ${r.status}`);
+    const detail = e?.error?.detail || '';
+    const status = r.status;
+    if (status === 429 || /too many requests/i.test(detail)) {
+      const err = new Error(detail || 'Too many requests — wait a moment and retry');
+      err.code = 429;
+      err.retryAfter = Number(r.headers?.get?.('Retry-After') || 0) || 15;
+      throw err;
+    }
+    throw new Error(detail || `YNAB ${status}`);
   }
   return r.json();
 }
@@ -621,15 +649,20 @@ function processTxns(raw, groupMap = {}) {
 // CACHE
 // ─────────────────────────────────────────────────────────────────────────────
 
-function getCached() {
+function getCached(allowStale = false) {
   const ts = ls(SK.CACHE_TS);
-  if (!ts || Date.now() - parseInt(ts, 10) > CACHE_TTL_MS) return null;
   const raw = lsJson(SK.CACHE_TXN, null);
   if (!Array.isArray(raw)) return null;
+  if (!allowStale && (!ts || Date.now() - parseInt(ts, 10) > CACHE_TTL_MS)) return null;
   // Normalize dates on read so older cache entries still compare correctly.
-  return raw.map((t) => (t && t.date && t.date.length !== 10 ? { ...t, date: ymd(t.date) } : t));
+  return raw.map((t) => (t && t.date && String(t.date).length !== 10 ? { ...t, date: ymd(t.date) } : t));
 }
 function setCache(txns) {
+  // Never clobber a good cache with an empty API/rate-limit result.
+  if (!Array.isArray(txns) || !txns.length) {
+    const existing = getCached(true);
+    if (existing?.length) return;
+  }
   try {
     localStorage.setItem(SK.CACHE_TXN, JSON.stringify(txns));
     localStorage.setItem(SK.CACHE_TS, String(Date.now()));
@@ -640,18 +673,91 @@ function setCache(txns) {
 }
 function bustCache()    { lsSet(SK.CACHE_TS, '0'); try { localStorage.removeItem(SK.CACHE_TXN); } catch (_) {} }
 
+function ynabWithTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, rej) => {
+    timer = setTimeout(() => rej(new Error(`${label || 'YNAB'} timed out`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    try {
+      clearTimeout(timer);
+    } catch (_) {}
+  });
+}
+
+let _ynabRateLimitUntil = 0;
+function ynabRateLimitUntil() {
+  const mem = _ynabRateLimitUntil || 0;
+  const stored = parseInt(ls(SK.RATE_LIMIT_UNTIL) || '0', 10) || 0;
+  return Math.max(mem, stored);
+}
+function ynabSetRateLimit(msFromNow) {
+  const until = Date.now() + Math.max(5000, msFromNow || 20000);
+  _ynabRateLimitUntil = until;
+  try {
+    localStorage.setItem(SK.RATE_LIMIT_UNTIL, String(until));
+  } catch (_) {}
+}
+
 async function getTransactions(force = false) {
-  if (!force) { const c = getCached(); if (c) return c; }
+  const stale = getCached(true);
+  if (!force) {
+    const fresh = getCached(false);
+    if (fresh) return fresh;
+  }
+  const now = Date.now();
+  const until = ynabRateLimitUntil();
+  if (now < until) {
+    // Soft-fail: never hard-error the panel on rate limit.
+    if (stale?.length) return stale;
+    return stale || [];
+  }
   const token = ls(SK.TOKEN), budgetId = ls(SK.BUDGET_ID);
-  if (!token || !budgetId) throw new Error('YNAB not configured');
-  // Fetch both in parallel — categories for the group lookup map
-  const [rawTxns, groupMap] = await Promise.all([
-    apiFetchTransactions(token, budgetId),
-    buildCategoryGroupMap(token, budgetId),
-  ]);
-  const txns = processTxns(rawTxns, groupMap);
-  setCache(txns);
-  return txns;
+  if (!token || !budgetId) {
+    if (stale?.length) return stale;
+    throw new Error('YNAB not configured');
+  }
+  try {
+    const [rawTxns, groupMap] = await ynabWithTimeout(
+      Promise.all([
+        apiFetchTransactions(token, budgetId),
+        buildCategoryGroupMap(token, budgetId),
+      ]),
+      20000,
+      'YNAB API'
+    );
+    const txns = processTxns(rawTxns, groupMap);
+    if (txns.length) setCache(txns);
+    else if (stale?.length) {
+      // Keep stale; don't replace with empty success payload.
+      try {
+        console.warn('[YNAB] API returned 0 txns; keeping stale cache');
+      } catch (_) {}
+      return stale;
+    } else {
+      setCache(txns);
+    }
+    try {
+      localStorage.removeItem(SK.RATE_LIMIT_UNTIL);
+    } catch (_) {}
+    _ynabRateLimitUntil = 0;
+    return txns.length ? txns : (stale || []);
+  } catch (e) {
+    if (e?.code === 429 || /too many requests/i.test(String(e?.message || ''))) {
+      const retry = Number(e?.retryAfter || 0) || 120;
+      ynabSetRateLimit(retry * 1000);
+    }
+    if (stale?.length) {
+      try {
+        console.warn('[YNAB] API failed; using stale cache', e);
+      } catch (_) {}
+      return stale;
+    }
+    if (e?.code === 429 || /too many requests/i.test(String(e?.message || ''))) {
+      return [];
+    }
+    throw e;
+  }
 }
 
 /** Read a Thymer record field with several SDK shapes. */
@@ -1484,6 +1590,26 @@ class DawnYnab {
       globalThis.__dawnYnab = {
         plugin: this,
         incomeSummary: (dayKey) => this._dashIncomeSummary(dayKey),
+        txns: () => {
+          const mem = Array.isArray(this._lastSyncTxns) ? this._lastSyncTxns : null;
+          if (mem?.length) return mem;
+          return getCached(true) || [];
+        },
+        ensureCache: () => {
+          void this._ynabEnsurePathBReady?.();
+          return getTransactions(false).then((txns) => {
+            // Never replace a good in-memory set with [].
+            if (Array.isArray(txns) && txns.length) this._lastSyncTxns = txns;
+            else if (!this._lastSyncTxns?.length) {
+              const stale = getCached(true);
+              this._lastSyncTxns = stale?.length ? stale : txns || [];
+            }
+            try {
+              globalThis.__dawnDash?.refreshNavExtras?.();
+            } catch (_) {}
+            return this._lastSyncTxns || txns || [];
+          });
+        },
       };
     } catch (_) {}
     this._mountJournalIncomeWidget = true;
@@ -1701,7 +1827,10 @@ class DawnYnab {
   }
 
   _dashIncomeSummary(dayKey) {
-    const raw = lsJson(SK.CACHE_TXN, null);
+    // Prefer in-memory sync / stale LS — Dashboard paints before TTL refresh.
+    const mem = Array.isArray(this._lastSyncTxns) ? this._lastSyncTxns : null;
+    const cached = getCached(true);
+    const raw = mem?.length ? mem : cached;
     const txns = Array.isArray(raw)
       ? raw.map((t) => (t && t.date ? { ...t, date: ymd(t.date) } : t))
       : [];
@@ -1721,28 +1850,22 @@ class DawnYnab {
       const sign = d > 0 ? '+' : '';
       return `${sign}${money(d)} vs last`;
     };
+    const pack = (bucket, label) => ({
+      label,
+      total: bucket.curTotal || 0,
+      prev: bucket.prevTotal ?? 0,
+      avg: bucket.avg || 0,
+      vs: vs(bucket.curTotal || 0, bucket.prevTotal),
+      labels: bucket.labels || [],
+      series: Array.isArray(bucket.cur) ? bucket.cur.map((n) => Number(n) || 0) : [],
+    });
     const daily = bucketData(income, ref, 'daily', true, true);
     const weekly = bucketData(income, ref, 'weekly', true, true);
     const monthly = bucketData(income, ref, 'monthly', true, true);
     return {
-      today: {
-        label: 'Today',
-        total: daily.curTotal || 0,
-        avg: daily.avg || 0,
-        vs: vs(daily.curTotal || 0, daily.prevTotal),
-      },
-      week: {
-        label: 'This week',
-        total: weekly.curTotal || 0,
-        avg: weekly.avg || 0,
-        vs: vs(weekly.curTotal || 0, weekly.prevTotal),
-      },
-      month: {
-        label: 'This month',
-        total: monthly.curTotal || 0,
-        avg: monthly.avg || 0,
-        vs: vs(monthly.curTotal || 0, monthly.prevTotal),
-      },
+      today: pack(daily, 'Today'),
+      week: pack(weekly, 'This week'),
+      month: pack(monthly, 'This month'),
     };
   }
 
@@ -1759,8 +1882,18 @@ class DawnYnab {
     const state = this._panelStates.get('jhs');
     if (!state?.rootEl) return;
     if (this._jhsDay) Object.assign(state, this._jhsDay);
+    // Prefill memory from LS so first paint isn't blank while API/rate-limit settles.
+    if (!this._lastSyncTxns?.length) {
+      try {
+        const stale = getCached(true);
+        if (stale?.length) this._lastSyncTxns = stale;
+      } catch (_) {}
+    }
     this._paintJhsCfgPrompt(state);
     await this._populateWidget(state);
+    try {
+      globalThis.__dawnDash?.refreshNavExtras?.();
+    } catch (_) {}
   }
 
   _ynabEnsurePathBReady() {
@@ -1939,33 +2072,42 @@ class DawnYnab {
       container.replaceChildren(this._cfgPrompt());
       return;
     }
+    const paintFromTxns = (txns, banner) => {
+      if (_ynabIsUserEditingInside(container)) {
+        diag?.record?.('YNAB_RENDER_ABORT_TYPING', { gen });
+        return false;
+      }
+      const newDash = this._buildDash(txns || []);
+      if (banner) {
+        const note = document.createElement('div');
+        note.className = 'ynab-dash-error';
+        note.style.cssText =
+          'margin:0 0 10px;padding:8px 10px;border-radius:8px;opacity:0.9;font-size:12px;';
+        note.textContent = banner;
+        newDash.prepend(note);
+      }
+      container.replaceChildren(newDash);
+      return true;
+    };
     try {
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
       if (gen !== this._ynabDashRenderGen) return;
       if (isFirstRender) {
         const loadEl = container.querySelector('.ynab-dash-loading');
-        if (loadEl) loadEl.textContent = 'Loading chart library…';
-      }
-      await loadChartJs();
-      if (gen !== this._ynabDashRenderGen) return;
-      if (isFirstRender) {
-        const loadEl = container.querySelector('.ynab-dash-loading');
         if (loadEl) loadEl.textContent = 'Loading transactions…';
       }
+      // Chart.js is optional — never block the whole panel on CDN failure.
+      try {
+        await loadChartJs();
+      } catch (chartErr) {
+        try {
+          console.warn('[YNAB] Chart.js unavailable; rendering without charts', chartErr);
+        } catch (_) {}
+      }
+      if (gen !== this._ynabDashRenderGen) return;
       const txns = await this._loadDashTxns(false);
       if (gen !== this._ynabDashRenderGen) return;
-      /**
-       * One more “user editing?” check right before the swap — `_renderDash` may
-       * have been kicked off before the user grabbed an input. If they’re typing
-       * now, abort the swap; the panel’s debounce loop will retry shortly.
-       */
-      if (_ynabIsUserEditingInside(container)) {
-        diag?.record?.('YNAB_RENDER_ABORT_TYPING', { gen });
-        return;
-      }
-      const newDash = this._buildDash(txns);
-      if (gen !== this._ynabDashRenderGen) return;
-      container.replaceChildren(newDash);
+      if (!paintFromTxns(txns)) return;
       diag?.record?.('YNAB_RENDER_END', {
         gen,
         ms: diag ? Date.now() - diagStart : 0,
@@ -1978,10 +2120,18 @@ class DawnYnab {
         err: String(e?.message || e).slice(0, 200),
       });
       if (gen !== this._ynabDashRenderGen) return;
-      const errEl = document.createElement('div');
-      errEl.className = 'ynab-dash-error';
-      errEl.textContent = `Error: ${e.message}`;
-      container.replaceChildren(errEl);
+      const rate =
+        e?.code === 429 || /too many requests/i.test(String(e?.message || ''));
+      const fallback =
+        (Array.isArray(this._lastSyncTxns) && this._lastSyncTxns.length && this._lastSyncTxns) ||
+        getCached(true) ||
+        [];
+      paintFromTxns(
+        Array.isArray(fallback) ? fallback : [],
+        rate
+          ? 'Rate limited — showing cached transactions when available'
+          : `Using cache (${e.message || 'unavailable'})`
+      );
     }
   }
 
@@ -2181,7 +2331,7 @@ class DawnYnab {
 
       const titleGrain = windowNote ? `${preferLabel} · ${windowNote}` : grainLabel;
       chartTitle.textContent = `Income & Expenses (${titleGrain}) — ${from} → ${to}`;
-      if (dashChart) { try { dashChart.destroy(); } catch {} }
+      if (dashChart) { try { dashChart.destroy(); } catch {} dashChart = null; }
 
       const greenFill = ctype === 'line' ? `rgba(${C.greenRgb}, 0.12)` : `rgba(${C.greenRgb}, 0.75)`;
       const redFill = ctype === 'line' ? 'rgba(184,64,64,0.12)' : 'rgba(184,64,64,0.55)';
@@ -2215,21 +2365,31 @@ class DawnYnab {
         });
       }
 
-      dashChart = new window.Chart(canvas, {
-        type: ctype,
-        data: { labels, datasets },
-        options: {
-          responsive: true, maintainAspectRatio: false, animation: { duration: 200 },
-          plugins: {
-            legend: { labels: { color: C.axisText, font: { size: 10 }, boxWidth: 14 } },
-            tooltip: { callbacks: { label: c => `${c.dataset.label}: ${fmt(c.parsed.y)}` } },
+      if (!window.Chart) {
+        chartTitle.textContent = `${chartTitle.textContent} · chart unavailable`;
+        return;
+      }
+      try {
+        dashChart = new window.Chart(canvas, {
+          type: ctype,
+          data: { labels, datasets },
+          options: {
+            responsive: true, maintainAspectRatio: false, animation: { duration: 200 },
+            plugins: {
+              legend: { labels: { color: C.axisText, font: { size: 10 }, boxWidth: 14 } },
+              tooltip: { callbacks: { label: c => `${c.dataset.label}: ${fmt(c.parsed.y)}` } },
+            },
+            scales: {
+              x: { ticks: { color: C.axisText, font: { size: 10 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 18 }, grid: { color: 'rgba(255,255,255,0.04)' } },
+              y: { ticks: { color: C.axisText, font: { size: 10 }, callback: v => `$${v}` }, grid: { color: 'rgba(255,255,255,0.04)' }, beginAtZero: true },
+            },
           },
-          scales: {
-            x: { ticks: { color: C.axisText, font: { size: 10 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 18 }, grid: { color: 'rgba(255,255,255,0.04)' } },
-            y: { ticks: { color: C.axisText, font: { size: 10 }, callback: v => `$${v}` }, grid: { color: 'rgba(255,255,255,0.04)' }, beginAtZero: true },
-          },
-        },
-      });
+        });
+      } catch (chartErr) {
+        try {
+          console.warn('[YNAB] dash chart', chartErr);
+        } catch (_) {}
+      }
     };
 
     const rebuild = () => {
@@ -2738,14 +2898,50 @@ class DawnYnab {
       return;
     }
 
-    if (statusEl) statusEl.textContent = 'Loading chart…';
+    if (statusEl) statusEl.textContent = 'Loading…';
 
     try {
+      // Cache-first paint (BK pattern) — never wait on network for first numbers.
+      const instant =
+        (Array.isArray(this._lastSyncTxns) && this._lastSyncTxns.length && this._lastSyncTxns) ||
+        getCached(true) ||
+        null;
+      if (instant?.length && statsEl) {
+        this._lastSyncTxns = instant;
+        const isIncome0 = (t) => isIncomeTransaction(t, instant);
+        const filtered0 = instant.filter((t) => isIncome0(t));
+        const period0 = ls(SK.WIDGET_PERIOD) || 'weekly';
+        const compare0 = ls(SK.WIDGET_COMPARE) === 'true';
+        const showAvg0 = ls(SK.WIDGET_AVG) === 'true';
+        const refDate0 = new Date(state.year, state.month - 1, state.day);
+        const { curTotal: ct0, prevTotal: pt0, avg: avg0 } = bucketData(
+          filtered0,
+          refDate0,
+          period0,
+          compare0,
+          showAvg0
+        );
+        statsEl.innerHTML = '';
+        const pl0 = { daily: 'Today', weekly: 'This Week', monthly: 'This Month' }[period0];
+        statsEl.appendChild(this._chip(pl0 + ' Income', ct0));
+        if (compare0 && pt0 !== null) {
+          const diff0 = ct0 - pt0;
+          statsEl.append(this._chip('vs Last', pt0), this._chip('Δ', diff0, diff0 >= 0 ? 'pos' : 'neg'));
+        }
+        if (showAvg0 && avg0 !== null) statsEl.appendChild(this._chip('Avg', avg0));
+        const ts0 = ls(SK.CACHE_TS);
+        if (statusEl) statusEl.textContent = ts0 ? `Synced ${new Date(parseInt(ts0, 10)).toLocaleTimeString()}` : 'Cached';
+      }
+
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      if (statusEl) statusEl.textContent = 'Loading chart library…';
-      await loadChartJs();
-      if (statusEl) statusEl.textContent = 'Loading transactions…';
-      const txns    = await getTransactions();
+      if (statusEl && !instant?.length) statusEl.textContent = 'Loading transactions…';
+      const txns = await getTransactions();
+      if (Array.isArray(txns) && txns.length) this._lastSyncTxns = txns;
+      else if (!this._lastSyncTxns?.length) this._lastSyncTxns = getCached(true) || txns || [];
+      const paintTxns = this._lastSyncTxns?.length ? this._lastSyncTxns : txns || [];
+      try {
+        globalThis.__dawnDash?.refreshNavExtras?.();
+      } catch (_) {}
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
       if (state.year !== snapY || state.month !== snapM || state.day !== snapD) {
         this._finishWidgetPopulate(state);
@@ -2753,8 +2949,8 @@ class DawnYnab {
       }
       if (!root?.isConnected) { this._finishWidgetPopulate(state); return; }
 
-      const isIncome = t => isIncomeTransaction(t, txns);
-      const filtered = txns.filter(t => isIncome(t));
+      const isIncome = t => isIncomeTransaction(t, paintTxns);
+      const filtered = paintTxns.filter(t => isIncome(t));
 
       // Render filter row — gear button + live summary
       if (filterRow) {
@@ -2763,14 +2959,21 @@ class DawnYnab {
         gearBtn.className = 'ynab-gear-btn';
         gearBtn.textContent = '⚙ Filters';
         gearBtn.addEventListener('click', () => {
-          this._showFilterSettings(txns, () => {
+          this._showFilterSettings(paintTxns, () => {
             this._populateWidget(this._panelStates.get(state.panelId));
           });
         });
         const summary = document.createElement('span');
         summary.className = 'ynab-filter-summary';
         const raw = ls(SK.INCL_PAYEES);
-        const inclCount = raw ? JSON.parse(raw).length : txns.filter(t=>t.type==='income').map(t=>t.payee).filter((p,i,a)=>a.indexOf(p)===i).filter(p=>!['transfer','starting'].some(kw=>p.toLowerCase().includes(kw))).length;
+        let inclCount = 0;
+        try {
+          const incl = raw ? JSON.parse(raw) : null;
+          if (Array.isArray(incl) && incl.length) inclCount = incl.length;
+          else inclCount = paintTxns.filter(t=>t.type==='income' || (!t.type && Number(t.amount)>0)).map(t=>t.payee).filter((p,i,a)=>a.indexOf(p)===i).filter(p=>!['transfer','starting'].some(kw=>String(p||'').toLowerCase().includes(kw))).length;
+        } catch (_) {
+          inclCount = 0;
+        }
         const exclCount = lsJson(SK.EXCLUDED_GROUPS, DEFAULT_EXCLUDED).length;
         summary.textContent = `${inclCount} payees · ${exclCount} groups excluded`;
         filterRow.append(gearBtn, summary);
@@ -2784,7 +2987,7 @@ class DawnYnab {
 
       const { labels, cur, prev, curTotal, prevTotal, avg } = bucketData(filtered, refDate, period, compare, showAvg);
 
-      // Stat chips — income only
+      // Stat chips — income only (paint before Chart.js so a CDN hang never blocks numbers)
       if (statsEl) {
         statsEl.innerHTML = '';
         const pl = { daily:'Today', weekly:'This Week', monthly:'This Month' }[period];
@@ -2796,47 +2999,59 @@ class DawnYnab {
         if (showAvg && avg !== null) statsEl.appendChild(this._chip('Avg', avg));
       }
 
-      // Chart
       const canvasEl = root.querySelector('[data-role="chart"]');
       if (canvasEl) {
-        const ex = this._chartInstances.get(state.panelId);
-        if (ex) { try { ex.destroy(); } catch {} }
+        if (statusEl) statusEl.textContent = 'Loading chart…';
+        try {
+          await loadChartJs();
+          if (state.year !== snapY || state.month !== snapM || state.day !== snapD) {
+            this._finishWidgetPopulate(state);
+            return;
+          }
+          const ex = this._chartInstances.get(state.panelId);
+          if (ex) { try { ex.destroy(); } catch {} }
 
-        const greenFill = ctype==='line' ? `rgba(${C.greenRgb}, 0.12)` : `rgba(${C.greenRgb}, 0.75)`;
+          const greenFill = ctype==='line' ? `rgba(${C.greenRgb}, 0.12)` : `rgba(${C.greenRgb}, 0.75)`;
 
-        const datasets = [{
-          label: 'Income', data: cur,
-          backgroundColor: greenFill, borderColor: C.green, borderWidth: ctype==='bar'?1:2,
-          tension: 0.35, fill: ctype==='line',
-          pointRadius: ctype==='line'?2:0, pointBackgroundColor: C.green,
-          type: ctype,
-        }];
-        if (compare && prev) datasets.push({
-          label:'Last Period', data:prev, type:'line',
-          backgroundColor:'transparent', borderColor: C.prevLine, borderWidth:1,
-          borderDash:[4,4], tension:0.35, fill:false, pointRadius:0,
-        });
-        if (showAvg && avg !== null) datasets.push({
-          label:'Avg', data:Array(labels.length).fill(avg), type:'line',
-          borderColor: C.avgLine, borderWidth:1, borderDash:[5,3], pointRadius:0, fill:false,
-        });
+          const datasets = [{
+            label: 'Income', data: cur,
+            backgroundColor: greenFill, borderColor: C.green, borderWidth: ctype==='bar'?1:2,
+            tension: 0.35, fill: ctype==='line',
+            pointRadius: ctype==='line'?2:0, pointBackgroundColor: C.green,
+            type: ctype,
+          }];
+          if (compare && prev) datasets.push({
+            label:'Last Period', data:prev, type:'line',
+            backgroundColor:'transparent', borderColor: C.prevLine, borderWidth:1,
+            borderDash:[4,4], tension:0.35, fill:false, pointRadius:0,
+          });
+          if (showAvg && avg !== null) datasets.push({
+            label:'Avg', data:Array(labels.length).fill(avg), type:'line',
+            borderColor: C.avgLine, borderWidth:1, borderDash:[5,3], pointRadius:0, fill:false,
+          });
 
-        const chart = new window.Chart(canvasEl, {
-          type: ctype,
-          data: { labels, datasets },
-          options: {
-            responsive:true, maintainAspectRatio:false, animation:{duration:220},
-            plugins:{
-              legend:{ display: compare||showAvg, labels:{color:C.axisText,font:{size:10},boxWidth:18} },
-              tooltip:{ callbacks:{label:c=>`${c.dataset.label}: ${fmt(c.parsed.y)}`} },
+          const chart = new window.Chart(canvasEl, {
+            type: ctype,
+            data: { labels, datasets },
+            options: {
+              responsive:true, maintainAspectRatio:false, animation:{duration:220},
+              plugins:{
+                legend:{ display: compare||showAvg, labels:{color:C.axisText,font:{size:10},boxWidth:18} },
+                tooltip:{ callbacks:{label:c=>`${c.dataset.label}: ${fmt(c.parsed.y)}`} },
+              },
+              scales:{
+                x:{ticks:{color:C.axisText,font:{size:10}},grid:{color:'rgba(255,255,255,0.04)'}},
+                y:{ticks:{color:C.axisText,font:{size:10},callback:v=>`$${v}`},grid:{color:'rgba(255,255,255,0.04)'},beginAtZero:true},
+              },
             },
-            scales:{
-              x:{ticks:{color:C.axisText,font:{size:10}},grid:{color:'rgba(255,255,255,0.04)'}},
-              y:{ticks:{color:C.axisText,font:{size:10},callback:v=>`$${v}`},grid:{color:'rgba(255,255,255,0.04)'},beginAtZero:true},
-            },
-          },
-        });
-        this._chartInstances.set(state.panelId, chart);
+          });
+          this._chartInstances.set(state.panelId, chart);
+        } catch (chartErr) {
+          try {
+            console.warn('[YNAB widget] chart', chartErr);
+          } catch (_) {}
+          // Leave canvas blank — stats already painted.
+        }
       }
 
       const ts = ls(SK.CACHE_TS);
@@ -2844,8 +3059,41 @@ class DawnYnab {
 
     } catch (e) {
       console.error('[YNAB widget]', e);
-      if (statusEl && state.year === snapY && state.month === snapM && state.day === snapD) {
-        statusEl.textContent = `Error: ${e.message}`;
+      // On 429 / empty API: still paint from any memory or stale LS cache.
+      try {
+        const fallback =
+          (Array.isArray(this._lastSyncTxns) && this._lastSyncTxns.length && this._lastSyncTxns) ||
+          getCached(true) ||
+          [];
+        if (fallback.length && statsEl && state.year === snapY && state.month === snapM && state.day === snapD) {
+          this._lastSyncTxns = fallback;
+          const isIncome = (t) => isIncomeTransaction(t, fallback);
+          const filtered = fallback.filter((t) => isIncome(t));
+          const period = ls(SK.WIDGET_PERIOD) || 'weekly';
+          const compare = ls(SK.WIDGET_COMPARE) === 'true';
+          const showAvg = ls(SK.WIDGET_AVG) === 'true';
+          const refDate = new Date(state.year, state.month - 1, state.day);
+          const { curTotal, prevTotal, avg } = bucketData(filtered, refDate, period, compare, showAvg);
+          statsEl.innerHTML = '';
+          const pl = { daily: 'Today', weekly: 'This Week', monthly: 'This Month' }[period];
+          statsEl.appendChild(this._chip(pl + ' Income', curTotal));
+          if (compare && prevTotal !== null) {
+            const diff = curTotal - prevTotal;
+            statsEl.append(this._chip('vs Last', prevTotal), this._chip('Δ', diff, diff >= 0 ? 'pos' : 'neg'));
+          }
+          if (showAvg && avg !== null) statsEl.appendChild(this._chip('Avg', avg));
+          if (statusEl) {
+            statusEl.textContent = e?.code === 429 || /too many requests/i.test(String(e?.message || ''))
+              ? 'Rate limited — showing cached income'
+              : `Error: ${e.message}`;
+          }
+        } else if (statusEl && state.year === snapY && state.month === snapM && state.day === snapD) {
+          statusEl.textContent = `Error: ${e.message}`;
+        }
+      } catch (_) {
+        if (statusEl && state.year === snapY && state.month === snapM && state.day === snapD) {
+          statusEl.textContent = `Error: ${e.message}`;
+        }
       }
     }
 
