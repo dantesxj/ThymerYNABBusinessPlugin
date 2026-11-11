@@ -1,0 +1,9 @@
+{
+  "name": "YNAB",
+  "icon": "ti-coin",
+  "description": "YNAB business dashboard and transaction sync. Install as global plugin; transaction rows stay in the YNAB collection (YNAB.json).",
+  "version": "1.1.1",
+  "custom": {
+    "mount_journal_income_widget": false
+  }
+}

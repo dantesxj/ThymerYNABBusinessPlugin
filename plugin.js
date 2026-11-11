@@ -1777,7 +1777,11 @@ class DawnYnab {
 
   _syncJhsHeaderControls(visible) {
     const shell = globalThis.__dawnJhsShell;
-    const host = shell?.getHeaderExtra?.();
+    // Own slot only — never wipe Dash pulse in headerExtra.
+    const host =
+      shell?.getYnabControlsHost?.() ||
+      shell?.getHeaderExtra?.()?.querySelector?.('[data-dawn-jhs-ynab-controls]') ||
+      null;
     if (!host) return;
     if (!visible) {
       host.innerHTML = '';
